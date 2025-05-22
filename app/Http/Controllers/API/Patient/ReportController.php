@@ -43,31 +43,36 @@ class ReportController extends Controller
         ]);
 
         $text = '';
+        $createdMetrics = [];
+        
         if ($ext === 'pdf') {
             try {
                 $text = PdfToText::getText($file->getPathname());
                 $text = $this->normalizePdfText($text);
-                $metrics = $this->extractHealthMetrics($text);
-
-                foreach ($metrics as $metric) {
-                    HealthMetric::create([
-                        'patient_id' => $patientId,
-                        'type' => Str::slug($metric['parameter'], '_'),
-                        'custom_type' => null,
-                        'value' => $metric['value'],
-                        'unit' => $metric['unit'],
-                        'measured_at' => now(),
-                        'notes' => 'Auto-extracted from report'
-                    ]);
+                
+                // ENHANCED: Extract health metrics using improved method
+                $extractedMetrics = $this->extractHealthMetricsAdvanced($text);
+                
+                // Create health metrics from extracted data
+                if (!empty($extractedMetrics)) {
+                    $createdMetrics = HealthMetric::createFromAIExtraction($patientId, $extractedMetrics);
                 }
+                
+                Log::info('Health metrics extracted and created', [
+                    'report_id' => $report->id,
+                    'metrics_count' => count($createdMetrics),
+                    'extracted_data' => $extractedMetrics
+                ]);
 
             } catch (\Exception $e) {
+                Log::error('PDF processing failed', ['error' => $e->getMessage()]);
                 return response()->json([
                     'error' => 'Unable to extract text from PDF. Please upload a valid or unlocked PDF.'
                 ], 422);
             }
         }
 
+        // Generate AI summary
         $aiSummaryJson = AISummaryService::generateSummary($text);
         AISummary::create([
             'report_id' => $report->id,
@@ -79,19 +84,23 @@ class ReportController extends Controller
             'ai_model_used' => 'gpt-4',
         ]);
 
-        if ($request->wantsJson()) {
-            return response()->json([
-                'message' => 'Report uploaded successfully.',
-                'report_id' => $report->id,
-                'raw_text_preview' => Str::limit($text, 300),
-                'summary' => $aiSummaryJson,
-                'confidence_score' => $aiSummaryJson['confidence_score'] ?? null,
-            ], 201);
-        } else {
-            return redirect()
-                ->route('patient.dashboard')
-                ->with('success', 'Report uploaded successfully!');
-        }
+        return response()->json([
+            'message' => 'Report uploaded successfully.',
+            'report_id' => $report->id,
+            'raw_text_preview' => Str::limit($text, 300),
+            'summary' => $aiSummaryJson,
+            'confidence_score' => $aiSummaryJson['confidence_score'] ?? null,
+            'health_metrics_created' => count($createdMetrics),
+            'created_metrics' => $createdMetrics->map(function($metric) {
+                return [
+                    'type' => $metric->type,
+                    'value' => $metric->value,
+                    'unit' => $metric->unit,
+                    'status' => $metric->status,
+                    'category' => $metric->category
+                ];
+            })
+        ], 201);
     }
 
     private function normalizePdfText($text)
@@ -101,21 +110,140 @@ class ReportController extends Controller
         return trim($text);
     }
 
-    private function extractHealthMetrics($text)
+    /**
+     * ENHANCED: Advanced health metrics extraction
+     * Handles various report formats and parameter naming conventions
+     */
+    private function extractHealthMetricsAdvanced($text)
     {
-        $matches = [];
-        preg_match_all('/([A-Z \(\)\/]+)\s+([\d\.]+)\s+([a-zA-Z\/\%µ]+)\s+([\d\.\- ]+)/', $text, $matches, PREG_SET_ORDER);
-
-        $data = [];
-        foreach ($matches as $match) {
-            $data[] = [
-                'parameter' => trim($match[1]),
-                'value' => $match[2],
-                'unit' => $match[3],
-                'ref_range' => $match[4]
-            ];
+        $extractedMetrics = [];
+        
+        // Pattern 1: Standard format - "Parameter Name: Value Unit"
+        preg_match_all('/([A-Za-z\s\(\)\/\-\.]+):\s*([\d\.]+)\s*([a-zA-Z\/\%µ°]+)?/i', $text, $matches1, PREG_SET_ORDER);
+        
+        // Pattern 2: Table format - "Parameter Name Value Unit Range"
+        preg_match_all('/([A-Z][A-Za-z\s\(\)\/\-\.]{3,})\s+([\d\.]+)\s+([a-zA-Z\/\%µ°]+)\s+([\d\.\-\s\<\>]+)/i', $text, $matches2, PREG_SET_ORDER);
+        
+        // Pattern 3: Lab format - "Parameter (Unit): Value"
+        preg_match_all('/([A-Za-z\s\(\)\/\-\.]+)\s*\(([a-zA-Z\/\%µ°]+)\):\s*([\d\.]+)/i', $text, $matches3, PREG_SET_ORDER);
+        
+        // Process Pattern 1 matches
+        foreach ($matches1 as $match) {
+            $parameter = trim($match[1]);
+            $value = $match[2];
+            $unit = isset($match[3]) ? trim($match[3]) : '';
+            
+            if ($this->isValidHealthParameter($parameter, $value)) {
+                $extractedMetrics[] = [
+                    'parameter' => $parameter,
+                    'value' => $value,
+                    'unit' => $unit,
+                    'pattern' => 'standard'
+                ];
+            }
         }
-        return $data;
+        
+        // Process Pattern 2 matches
+        foreach ($matches2 as $match) {
+            $parameter = trim($match[1]);
+            $value = $match[2];
+            $unit = trim($match[3]);
+            $range = trim($match[4]);
+            
+            if ($this->isValidHealthParameter($parameter, $value)) {
+                $extractedMetrics[] = [
+                    'parameter' => $parameter,
+                    'value' => $value,
+                    'unit' => $unit,
+                    'reference_range' => $range,
+                    'pattern' => 'table'
+                ];
+            }
+        }
+        
+        // Process Pattern 3 matches
+        foreach ($matches3 as $match) {
+            $parameter = trim($match[1]);
+            $unit = trim($match[2]);
+            $value = $match[3];
+            
+            if ($this->isValidHealthParameter($parameter, $value)) {
+                $extractedMetrics[] = [
+                    'parameter' => $parameter,
+                    'value' => $value,
+                    'unit' => $unit,
+                    'pattern' => 'lab'
+                ];
+            }
+        }
+        
+        // Remove duplicates based on parameter name
+        $uniqueMetrics = [];
+        foreach ($extractedMetrics as $metric) {
+            $key = strtolower(preg_replace('/[^a-zA-Z0-9]/', '', $metric['parameter']));
+            if (!isset($uniqueMetrics[$key])) {
+                $uniqueMetrics[$key] = $metric;
+            }
+        }
+        
+        return array_values($uniqueMetrics);
+    }
+    
+    /**
+     * Validate if extracted parameter is a valid health metric
+     */
+    private function isValidHealthParameter($parameter, $value)
+    {
+        // Skip if parameter is too short or too long
+        if (strlen(trim($parameter)) < 3 || strlen(trim($parameter)) > 50) {
+            return false;
+        }
+        
+        // Skip if value is not numeric
+        if (!is_numeric($value)) {
+            return false;
+        }
+        
+        // Skip common non-health parameters
+        $skipList = [
+            'page', 'date', 'time', 'phone', 'age', 'year', 'report', 'id', 'number',
+            'address', 'name', 'total', 'amount', 'cost', 'price', 'fee'
+        ];
+        
+        $paramLower = strtolower($parameter);
+        foreach ($skipList as $skip) {
+            if (strpos($paramLower, $skip) !== false) {
+                return false;
+            }
+        }
+        
+        // Additional validation: health-related keywords
+        $healthKeywords = [
+            'blood', 'serum', 'plasma', 'urine', 'level', 'count', 'rate', 'ratio',
+            'glucose', 'cholesterol', 'protein', 'vitamin', 'mineral', 'enzyme',
+            'hormone', 'pressure', 'sugar', 'iron', 'calcium', 'sodium'
+        ];
+        
+        foreach ($healthKeywords as $keyword) {
+            if (strpos($paramLower, $keyword) !== false) {
+                return true;
+            }
+        }
+        
+        // Check if parameter matches common health test names
+        $commonTests = [
+            'hdl', 'ldl', 'alt', 'ast', 'tsh', 'hemoglobin', 'hematocrit', 'creatinine',
+            'bilirubin', 'albumin', 'globulin', 'triglycerides', 'uric', 'ferritin',
+            'folate', 'b12', 'vitamin', 'rbc', 'wbc', 'platelet', 'mcv', 'mch', 'mchc'
+        ];
+        
+        foreach ($commonTests as $test) {
+            if (strpos($paramLower, $test) !== false) {
+                return true;
+            }
+        }
+        
+        return false;
     }
 
     public function index()
@@ -184,31 +312,24 @@ class ReportController extends Controller
             'message' => 'Report deleted successfully'
         ]);
     }
+
     /**
      * Get detailed information for a specific finding
-     *
-     * @param Request $request
-     * @param int $reportId
-     * @return \Illuminate\Http\JsonResponse
      */
     public function getFindingDetails(Request $request, $id)
     {
         try {
-            // Log the incoming request data
             Log::info('Finding details request', [
                 'report_id' => $id,
                 'request_data' => $request->all()
             ]);
             
-            // Less restrictive validation to handle various formats
             $validated = $request->validate([
                 'finding' => 'required',
             ]);
             
-            // Get the finding data
             $finding = $request->input('finding');
             
-            // Get the report for context
             $report = PatientReport::where('id', $id)
                 ->where('patient_id', auth()->id())
                 ->first();
@@ -220,11 +341,9 @@ class ReportController extends Controller
                 ], 404);
             }
             
-            // Get some context from the report file if available
             $context = '';
             if ($report->file_path && Storage::exists($report->file_path)) {
                 try {
-                    // Get first 1000 characters for context
                     $fileContents = Storage::get($report->file_path);
                     $context = substr($fileContents, 0, 1000);
                 } catch (\Exception $e) {
@@ -232,11 +351,9 @@ class ReportController extends Controller
                         'error' => $e->getMessage(),
                         'report_id' => $id
                     ]);
-                    // Continue without context
                 }
             }
             
-            // Generate detailed information for the finding
             $details = AISummaryService::generateFindingDetails($finding, $context);
             
             return response()->json([
@@ -257,6 +374,7 @@ class ReportController extends Controller
             ], 500);
         }
     }
+
     public function downloadSummaryPdf($id)
     {
         $report = PatientReport::with('aiSummary')
