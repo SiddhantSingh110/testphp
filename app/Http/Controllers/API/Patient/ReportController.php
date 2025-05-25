@@ -7,6 +7,8 @@ use App\Models\PatientReport;
 use App\Models\AISummary;
 use App\Models\HealthMetric;
 use App\Services\AISummaryService;
+use App\Services\OCRService;
+use App\Services\ImageProcessingService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
@@ -16,10 +18,22 @@ use Barryvdh\DomPDF\Facade\Pdf as DomPdf;
 
 class ReportController extends Controller
 {
+    protected $ocrService;
+    protected $imageProcessingService;
+
+    public function __construct(OCRService $ocrService, ImageProcessingService $imageProcessingService)
+    {
+        $this->ocrService = $ocrService;
+        $this->imageProcessingService = $imageProcessingService;
+        
+        // Ensure storage directories exist
+        ImageProcessingService::ensureDirectoriesExist();
+    }
+
     public function upload(Request $request)
     {
         $request->validate([
-            'file' => 'required|file|mimes:pdf,jpeg,png,jpg',
+            'file' => 'required|file|mimes:pdf,jpeg,png,jpg|max:20480', // 20MB max
             'notes' => 'nullable|string',
             'report_date' => 'nullable|date',
             'report_title' => 'nullable|string|max:255',
@@ -28,81 +42,258 @@ class ReportController extends Controller
         $patientId = auth()->id();
         $file = $request->file('file');
         $ext = $file->getClientOriginalExtension();
-        $filename = Str::uuid() . '.' . $ext;
-        $path = $file->storeAs('patient_reports', $filename, 'public');
+        $isImage = in_array($ext, ['jpg', 'jpeg', 'png']);
+        $isPdf = $ext === 'pdf';
 
-        $report = PatientReport::create([
+        Log::info('Report upload started', [
             'patient_id' => $patientId,
-            'doctor_id' => null,
-            'file_path' => $path,
-            'type' => $ext === 'pdf' ? 'pdf' : 'image',
-            'notes' => $request->notes,
-            'report_date' => $request->report_date ?? now(),
-            'report_title' => $request->report_title ?? 'Medical Report',
-            'uploaded_by' => 'patient',
+            'file_type' => $ext,
+            'file_size' => $file->getSize(),
+            'is_image' => $isImage
         ]);
 
-        $text = '';
-        $createdMetrics = [];
-        
-        if ($ext === 'pdf') {
-            try {
-                $text = PdfToText::getText($file->getPathname());
-                $text = $this->normalizePdfText($text);
+        try {
+            // Step 1: Handle file storage based on type
+            if ($isImage) {
+                // Validate image file
+                $validation = $this->imageProcessingService->validateImageFile($file);
+                if (!$validation['valid']) {
+                    return response()->json(['error' => $validation['error']], 422);
+                }
+
+                // Process image (create both high-quality and compressed versions)
+                $imageResult = $this->imageProcessingService->processUploadedImage($file, $patientId);
                 
-                // ENHANCED: Extract health metrics using improved method
-                $extractedMetrics = $this->extractHealthMetricsAdvanced($text);
+                if (!$imageResult['success']) {
+                    return response()->json(['error' => 'Failed to process image: ' . $imageResult['error']], 500);
+                }
+
+                $filePath = $imageResult['compressed_path']; 
+                $originalFilePath = $imageResult['original_path'];
+                $compressedFilePath = $imageResult['compressed_path'];
+                $ocrStatus = PatientReport::OCR_STATUS_PENDING;
+
+            } else if ($isPdf) {
+                // Handle PDF upload (existing logic)
+                $filename = Str::uuid() . '.pdf';
+                $filePath = $file->storeAs('patient_reports/pdfs', $filename, 'public');
+                $originalFilePath = null;
+                $compressedFilePath = null;
+                $ocrStatus = PatientReport::OCR_STATUS_NOT_REQUIRED;
+            } else {
+                return response()->json(['error' => 'Unsupported file type'], 422);
+            }
+
+            // Step 2: Create report record
+            $report = PatientReport::create([
+                'patient_id' => $patientId,
+                'doctor_id' => null,
+                'file_path' => $filePath,
+                'original_file_path' => $originalFilePath,
+                'compressed_file_path' => $compressedFilePath,
+                'type' => $isImage ? 'image' : 'pdf',
+                'notes' => $request->notes,
+                'report_date' => $request->report_date ?? now(),
+                'report_title' => $request->report_title ?? 'Medical Report',
+                'uploaded_by' => 'patient',
+                'ocr_status' => $ocrStatus,
+                'processing_attempts' => 0
+            ]);
+
+            // Step 3: Process file for text extraction
+            $extractedText = '';
+            $createdMetrics = [];
+            
+            if ($isPdf) {
+                // Extract text from PDF
+                $extractedText = $this->extractTextFromPDF($file);
+            } else if ($isImage) {
+                // Process image with OCR
+                $ocrResult = $this->processImageWithOCR($report);
+                $extractedText = $ocrResult['text'];
                 
-                // Create health metrics from extracted data
+                // Update report with OCR results
+                if ($ocrResult['success']) {
+                    $report->markOCRAsCompleted($ocrResult['confidence']);
+                } else {
+                    $report->markOCRAsFailed();
+                    Log::warning('OCR processing failed for report', [
+                        'report_id' => $report->id,
+                        'error' => $ocrResult['error']
+                    ]);
+                }
+            }
+
+            // Step 4: Extract health metrics if we have text
+            if (!empty($extractedText)) {
+                $extractedMetrics = $this->extractHealthMetricsAdvanced($extractedText);
                 if (!empty($extractedMetrics)) {
                     $createdMetrics = HealthMetric::createFromAIExtraction($patientId, $extractedMetrics);
                 }
-                
-                Log::info('Health metrics extracted and created', [
-                    'report_id' => $report->id,
-                    'metrics_count' => count($createdMetrics),
-                    'extracted_data' => $extractedMetrics
-                ]);
-
-            } catch (\Exception $e) {
-                Log::error('PDF processing failed', ['error' => $e->getMessage()]);
-                return response()->json([
-                    'error' => 'Unable to extract text from PDF. Please upload a valid or unlocked PDF.'
-                ], 422);
             }
+
+            // Step 5: Generate AI summary with cleaned text
+            $aiSummaryJson = null;
+            $cleanedText = '';
+            
+            if (!empty($extractedText)) {
+                // Clean text for database storage - remove problematic characters
+                $cleanedText = $this->cleanTextForDatabase($extractedText);
+                $aiSummaryJson = AISummaryService::generateSummary($cleanedText);
+            }
+
+            // Create AI summary record
+            AISummary::create([
+                'report_id' => $report->id,
+                'raw_text' => $cleanedText, // Use cleaned text
+                'summary_json' => $aiSummaryJson ?? [],
+                'confidence_score' => isset($aiSummaryJson['confidence_score']) 
+                    ? (int) filter_var($aiSummaryJson['confidence_score'], FILTER_SANITIZE_NUMBER_INT) 
+                    : 0,
+                'ai_model_used' => 'gpt-4',
+            ]);
+
+            // Step 6: Clean up original file if OCR was successful
+            if ($isImage && $report->isOCRComplete()) {
+                // Schedule cleanup after successful processing
+                $report->cleanupTemporaryFiles();
+            }
+
+            // Step 7: Prepare response
+            $response = [
+                'message' => 'Report uploaded successfully.',
+                'report_id' => $report->id,
+                'file_type' => $report->type,
+                'ocr_status' => $report->ocr_status,
+                'raw_text_preview' => Str::limit($extractedText, 300),
+                'summary' => $aiSummaryJson,
+                'confidence_score' => $aiSummaryJson['confidence_score'] ?? null,
+                'health_metrics_created' => count($createdMetrics),
+                'created_metrics' => collect($createdMetrics)->map(function($metric) {
+                    return [
+                        'type' => $metric->type,
+                        'value' => $metric->value,
+                        'unit' => $metric->unit,
+                        'status' => $metric->status,
+                        'category' => $metric->category
+                    ];
+                })
+            ];
+
+            // Add OCR specific information for images
+            if ($isImage) {
+                $response['ocr_info'] = $report->getOCRStatusInfo();
+                if ($report->ocr_confidence) {
+                    $response['ocr_confidence'] = $report->ocr_confidence;
+                }
+            }
+
+            Log::info('Report upload completed', [
+                'report_id' => $report->id,
+                'ocr_status' => $report->ocr_status,
+                'metrics_created' => count($createdMetrics)
+            ]);
+
+            return response()->json($response, 201);
+
+        } catch (\Exception $e) {
+            Log::error('Report upload failed', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+                'patient_id' => $patientId
+            ]);
+
+            return response()->json([
+                'error' => 'Upload failed. Please try again.',
+                'message' => config('app.debug') ? $e->getMessage() : 'An error occurred during upload.'
+            ], 500);
         }
-
-        // Generate AI summary
-        $aiSummaryJson = AISummaryService::generateSummary($text);
-        AISummary::create([
-            'report_id' => $report->id,
-            'raw_text' => $text,
-            'summary_json' => $aiSummaryJson ?? [],
-            'confidence_score' => isset($aiSummaryJson['confidence_score']) 
-                ? (int) filter_var($aiSummaryJson['confidence_score'], FILTER_SANITIZE_NUMBER_INT) 
-                : 0,
-            'ai_model_used' => 'gpt-4',
-        ]);
-
-        return response()->json([
-            'message' => 'Report uploaded successfully.',
-            'report_id' => $report->id,
-            'raw_text_preview' => Str::limit($text, 300),
-            'summary' => $aiSummaryJson,
-            'confidence_score' => $aiSummaryJson['confidence_score'] ?? null,
-            'health_metrics_created' => count($createdMetrics),
-            'created_metrics' => collect($createdMetrics)->map(function($metric) {
-                return [
-                    'type' => $metric->type,
-                    'value' => $metric->value,
-                    'unit' => $metric->unit,
-                    'status' => $metric->status,
-                    'category' => $metric->category
-                ];
-            })
-        ], 201);
     }
 
+    /**
+     * Clean text for database storage
+     */
+    private function cleanTextForDatabase($text)
+    {
+        // Remove problematic characters that cause MySQL encoding issues
+        $text = mb_convert_encoding($text, 'UTF-8', 'UTF-8');
+        
+        // Remove or replace problematic characters
+        $text = preg_replace('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', '', $text);
+        
+        // Replace common problematic characters
+        $text = str_replace(['�', chr(194), chr(162)], ['', '', ''], $text);
+        
+        // Ensure valid UTF-8
+        if (!mb_check_encoding($text, 'UTF-8')) {
+            $text = mb_convert_encoding($text, 'UTF-8', 'auto');
+        }
+        
+        return $text;
+    }
+
+    /**
+     * Process image with OCR
+     */
+    private function processImageWithOCR(PatientReport $report)
+    {
+        try {
+            $report->markOCRAsProcessing();
+            
+            $ocrFilePath = $report->getOCRFilePath();
+            if (!$ocrFilePath || !file_exists($ocrFilePath)) {
+                throw new \Exception('OCR file not found: ' . $ocrFilePath);
+            }
+
+            Log::info('Starting OCR processing', [
+                'report_id' => $report->id,
+                'file_path' => $ocrFilePath
+            ]);
+
+            // Perform OCR
+            $ocrResult = $this->ocrService->extractTextFromImage($ocrFilePath);
+
+            Log::info('OCR processing result', [
+                'report_id' => $report->id,
+                'success' => $ocrResult['success'],
+                'confidence' => $ocrResult['confidence'],
+                'text_length' => strlen($ocrResult['text'])
+            ]);
+
+            return $ocrResult;
+
+        } catch (\Exception $e) {
+            Log::error('OCR processing failed', [
+                'report_id' => $report->id,
+                'error' => $e->getMessage()
+            ]);
+
+            return [
+                'text' => '',
+                'confidence' => 0,
+                'success' => false,
+                'error' => $e->getMessage()
+            ];
+        }
+    }
+
+    /**
+     * Extract text from PDF
+     */
+    private function extractTextFromPDF($file)
+    {
+        try {
+            $text = PdfToText::getText($file->getPathname());
+            return $this->normalizePdfText($text);
+        } catch (\Exception $e) {
+            Log::error('PDF text extraction failed', ['error' => $e->getMessage()]);
+            throw new \Exception('Unable to extract text from PDF. Please ensure it is not password protected.');
+        }
+    }
+
+    /**
+     * Normalize PDF text
+     */
     private function normalizePdfText($text)
     {
         $text = preg_replace("/\n([A-Za-z])/m", " $1", $text);
@@ -111,8 +302,7 @@ class ReportController extends Controller
     }
 
     /**
-     * ENHANCED: Advanced health metrics extraction
-     * Handles various report formats and parameter naming conventions
+     * Enhanced health metrics extraction
      */
     private function extractHealthMetricsAdvanced($text)
     {
@@ -127,7 +317,7 @@ class ReportController extends Controller
         // Pattern 3: Lab format - "Parameter (Unit): Value"
         preg_match_all('/([A-Za-z\s\(\)\/\-\.]+)\s*\(([a-zA-Z\/\%µ°]+)\):\s*([\d\.]+)/i', $text, $matches3, PREG_SET_ORDER);
         
-        // Process Pattern 1 matches
+        // Process matches
         foreach ($matches1 as $match) {
             $parameter = trim($match[1]);
             $value = $match[2];
@@ -143,41 +333,7 @@ class ReportController extends Controller
             }
         }
         
-        // Process Pattern 2 matches
-        foreach ($matches2 as $match) {
-            $parameter = trim($match[1]);
-            $value = $match[2];
-            $unit = trim($match[3]);
-            $range = trim($match[4]);
-            
-            if ($this->isValidHealthParameter($parameter, $value)) {
-                $extractedMetrics[] = [
-                    'parameter' => $parameter,
-                    'value' => $value,
-                    'unit' => $unit,
-                    'reference_range' => $range,
-                    'pattern' => 'table'
-                ];
-            }
-        }
-        
-        // Process Pattern 3 matches
-        foreach ($matches3 as $match) {
-            $parameter = trim($match[1]);
-            $unit = trim($match[2]);
-            $value = $match[3];
-            
-            if ($this->isValidHealthParameter($parameter, $value)) {
-                $extractedMetrics[] = [
-                    'parameter' => $parameter,
-                    'value' => $value,
-                    'unit' => $unit,
-                    'pattern' => 'lab'
-                ];
-            }
-        }
-        
-        // Remove duplicates based on parameter name
+        // Remove duplicates
         $uniqueMetrics = [];
         foreach ($extractedMetrics as $metric) {
             $key = strtolower(preg_replace('/[^a-zA-Z0-9]/', '', $metric['parameter']));
@@ -188,23 +344,20 @@ class ReportController extends Controller
         
         return array_values($uniqueMetrics);
     }
-    
+
     /**
-     * Validate if extracted parameter is a valid health metric
+     * Validate health parameter
      */
     private function isValidHealthParameter($parameter, $value)
     {
-        // Skip if parameter is too short or too long
         if (strlen(trim($parameter)) < 3 || strlen(trim($parameter)) > 50) {
             return false;
         }
         
-        // Skip if value is not numeric
         if (!is_numeric($value)) {
             return false;
         }
         
-        // Skip common non-health parameters
         $skipList = [
             'page', 'date', 'time', 'phone', 'age', 'year', 'report', 'id', 'number',
             'address', 'name', 'total', 'amount', 'cost', 'price', 'fee'
@@ -217,33 +370,94 @@ class ReportController extends Controller
             }
         }
         
-        // Additional validation: health-related keywords
-        $healthKeywords = [
-            'blood', 'serum', 'plasma', 'urine', 'level', 'count', 'rate', 'ratio',
-            'glucose', 'cholesterol', 'protein', 'vitamin', 'mineral', 'enzyme',
-            'hormone', 'pressure', 'sugar', 'iron', 'calcium', 'sodium'
-        ];
-        
-        foreach ($healthKeywords as $keyword) {
-            if (strpos($paramLower, $keyword) !== false) {
-                return true;
-            }
+        return true;
+    }
+
+    /**
+     * Retry OCR processing for failed reports
+     */
+    public function retryOCR(Request $request, $id)
+    {
+        $patientId = auth()->id();
+        $report = PatientReport::where('patient_id', $patientId)
+            ->where('id', $id)
+            ->firstOrFail();
+
+        if (!$report->canRetryOCR()) {
+            return response()->json([
+                'error' => 'Cannot retry OCR for this report',
+                'reason' => $report->processing_attempts >= 3 ? 'Maximum attempts exceeded' : 'Report status does not allow retry'
+            ], 400);
         }
-        
-        // Check if parameter matches common health test names
-        $commonTests = [
-            'hdl', 'ldl', 'alt', 'ast', 'tsh', 'hemoglobin', 'hematocrit', 'creatinine',
-            'bilirubin', 'albumin', 'globulin', 'triglycerides', 'uric', 'ferritin',
-            'folate', 'b12', 'vitamin', 'rbc', 'wbc', 'platelet', 'mcv', 'mch', 'mchc'
-        ];
-        
-        foreach ($commonTests as $test) {
-            if (strpos($paramLower, $test) !== false) {
-                return true;
+
+        try {
+            // Process image with OCR
+            $ocrResult = $this->processImageWithOCR($report);
+            
+            if ($ocrResult['success']) {
+                $report->markOCRAsCompleted($ocrResult['confidence']);
+                
+                // Re-run AI processing with the new text
+                if (!empty($ocrResult['text'])) {
+                    $cleanedText = $this->cleanTextForDatabase($ocrResult['text']);
+                    $aiSummaryJson = AISummaryService::generateSummary($cleanedText);
+                    
+                    // Update existing AI summary
+                    $report->aiSummary()->updateOrCreate(
+                        ['report_id' => $report->id],
+                        [
+                            'raw_text' => $cleanedText,
+                            'summary_json' => $aiSummaryJson ?? [],
+                            'confidence_score' => isset($aiSummaryJson['confidence_score']) 
+                                ? (int) filter_var($aiSummaryJson['confidence_score'], FILTER_SANITIZE_NUMBER_INT) 
+                                : 0,
+                            'ai_model_used' => 'gpt-4',
+                        ]
+                    );
+                }
+                
+                // Clean up original file after successful retry
+                $report->cleanupTemporaryFiles();
+                
+            } else {
+                $report->markOCRAsFailed();
             }
+
+            return response()->json([
+                'success' => $ocrResult['success'],
+                'message' => $ocrResult['success'] ? 'OCR retry successful' : 'OCR retry failed',
+                'ocr_info' => $report->getOCRStatusInfo(),
+                'text_preview' => $ocrResult['success'] ? Str::limit($ocrResult['text'], 200) : null
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('OCR retry failed', [
+                'report_id' => $id,
+                'error' => $e->getMessage()
+            ]);
+
+            return response()->json([
+                'error' => 'OCR retry failed',
+                'message' => $e->getMessage()
+            ], 500);
         }
-        
-        return false;
+    }
+
+    /**
+     * Get OCR status for a report
+     */
+    public function getOCRStatus($id)
+    {
+        $patientId = auth()->id();
+        $report = PatientReport::where('patient_id', $patientId)
+            ->where('id', $id)
+            ->firstOrFail();
+
+        return response()->json([
+            'report_id' => $report->id,
+            'ocr_info' => $report->getOCRStatusInfo(),
+            'file_info' => $report->getFileSizeInfo()
+        ]);
     }
 
     public function index()
@@ -262,9 +476,10 @@ class ReportController extends Controller
                     'report_date' => $report->report_date,
                     'file_type' => $report->type,
                     'summary_diagnosis' => $report->aiSummary->summary_json['diagnosis'] ?? null,
-                    'file_url' => Storage::disk('public')->url($report->file_path),
+                    'file_url' => $report->getFileUrl(),
                     'uploaded_by' => $report->uploaded_by,
                     'doctor_name' => $report->doctor ? $report->doctor->name : null,
+                    'ocr_info' => $report->type === 'image' ? $report->getOCRStatusInfo() : null,
                 ];
             });
 
@@ -287,7 +502,7 @@ class ReportController extends Controller
             'report_date' => $report->report_date,
             'notes' => $report->notes,
             'uploaded_at' => $report->created_at->toDateTimeString(),
-            'file_url' => Storage::disk('public')->url($report->file_path),
+            'file_url' => $report->getFileUrl(),
             'file_type' => $report->type,
             'uploaded_by' => $report->uploaded_by,
             'doctor_name' => $report->doctor ? $report->doctor->name : null,
@@ -295,6 +510,7 @@ class ReportController extends Controller
             'confidence_score' => $report->aiSummary->confidence_score ?? null,
             'ai_model_used' => $report->aiSummary->ai_model_used ?? null,
             'raw_text' => Str::limit($report->aiSummary->raw_text ?? '', 1500),
+            'ocr_info' => $report->type === 'image' ? $report->getOCRStatusInfo() : null,
         ]);
     }
 
@@ -305,7 +521,19 @@ class ReportController extends Controller
             ->where('id', $id)
             ->firstOrFail();
 
-        Storage::disk('public')->delete($report->file_path);
+        // Delete all associated files
+        if ($report->file_path && Storage::disk('public')->exists($report->file_path)) {
+            Storage::disk('public')->delete($report->file_path);
+        }
+        
+        if ($report->original_file_path && Storage::disk('public')->exists($report->original_file_path)) {
+            Storage::disk('public')->delete($report->original_file_path);
+        }
+        
+        if ($report->compressed_file_path && Storage::disk('public')->exists($report->compressed_file_path)) {
+            Storage::disk('public')->delete($report->compressed_file_path);
+        }
+
         $report->delete();
 
         return response()->json([

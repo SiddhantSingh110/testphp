@@ -60,15 +60,53 @@ Route::middleware('auth:sanctum')->prefix('patient')->group(function () {
     Route::get('/metrics/categorized', [HealthMetricsController::class, 'categorizedMetrics']);
 });
 
-// Patient report routes (protected)
+// 📁 Patient report routes (protected) - ENHANCED with OCR functionality
 Route::middleware('auth:sanctum')->prefix('patient')->group(function () {
+    // Core report management
     Route::post('/reports', [ReportController::class, 'upload']);
     Route::get('/reports', [ReportController::class, 'index']);
     Route::get('/reports/{id}', [ReportController::class, 'show']);
+    Route::delete('/reports/{id}', [ReportController::class, 'destroy']);
+    
+    // AI and finding details
     Route::get('/reports/{id}/summary-pdf', [ReportController::class, 'downloadSummaryPdf']);
     Route::post('/reports/{id}/findings', [ReportController::class, 'getFindingDetails']);
-    Route::delete('/reports/{id}', [ReportController::class, 'destroy']);
+    
+    // 🆕 OCR-specific routes
+    Route::post('/reports/{id}/retry-ocr', [ReportController::class, 'retryOCR']);
+    Route::get('/reports/{id}/ocr-status', [ReportController::class, 'getOCRStatus']);
 });
 
-// Returns a list of reports uploaded by the logged-in doctor.
-// This route is already defined under the '/doctor' prefix group, so this duplicate is removed.
+// 🆕 System utility routes for OCR
+Route::middleware('auth:sanctum')->prefix('system')->group(function () {
+    // Check OCR service availability
+    Route::get('/ocr/status', function () {
+        try {
+            $ocrService = app(\App\Services\OCRService::class);
+            return response()->json([
+                'available' => \App\Services\OCRService::isAvailable(),
+                'version' => $ocrService->getVersion(),
+                'status' => 'operational'
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'available' => false,
+                'error' => $e->getMessage(),
+                'status' => 'error'
+            ], 500);
+        }
+    });
+    
+    // Get reports that need OCR processing (for background jobs)
+    Route::get('/ocr/pending', function () {
+        $pendingReports = \App\Models\PatientReport::needsOCR()
+            ->with('patient:id,name')
+            ->limit(10)
+            ->get(['id', 'patient_id', 'file_path', 'original_file_path', 'processing_attempts', 'created_at']);
+            
+        return response()->json([
+            'pending_reports' => $pendingReports,
+            'count' => $pendingReports->count()
+        ]);
+    });
+});
