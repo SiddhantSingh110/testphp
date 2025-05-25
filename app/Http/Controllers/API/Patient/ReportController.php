@@ -128,7 +128,12 @@ class ReportController extends Controller
             if (!empty($extractedText)) {
                 $extractedMetrics = $this->extractHealthMetricsAdvanced($extractedText);
                 if (!empty($extractedMetrics)) {
-                    $createdMetrics = HealthMetric::createFromAIExtraction($patientId, $extractedMetrics);
+                    $createdMetrics = HealthMetric::createFromAIExtraction(
+                        $patientId, 
+                        $extractedMetrics, 
+                        $report->report_date ?? now(),
+                        $report->id // Pass report ID for reference
+                    );
                 }
             }
 
@@ -159,7 +164,7 @@ class ReportController extends Controller
                 $report->cleanupTemporaryFiles();
             }
 
-            // Step 7: Prepare response
+            // Step 7: Enhanced response with detailed health metrics info
             $response = [
                 'message' => 'Report uploaded successfully.',
                 'report_id' => $report->id,
@@ -168,14 +173,33 @@ class ReportController extends Controller
                 'raw_text_preview' => Str::limit($extractedText, 300),
                 'summary' => $aiSummaryJson,
                 'confidence_score' => $aiSummaryJson['confidence_score'] ?? null,
-                'health_metrics_created' => count($createdMetrics),
-                'created_metrics' => collect($createdMetrics)->map(function($metric) {
+                
+                // ✨ Enhanced health metrics information
+                'health_metrics' => [
+                    'total_extracted' => count($createdMetrics),
+                    'extraction_successful' => count($createdMetrics) > 0,
+                    'metrics_summary' => $this->formatExtractedMetricsSummary($createdMetrics),
+                    'categories_found' => $this->getMetricCategories($createdMetrics),
+                    'new_metrics_available' => count($createdMetrics) > 0 ? true : false,
+                ],
+                
+                // Individual metric details for frontend
+                'extracted_metrics_details' => collect($createdMetrics)->map(function($metric) {
                     return [
+                        'id' => $metric->id,
                         'type' => $metric->type,
+                        'display_name' => $this->getMetricDisplayName($metric->type),
                         'value' => $metric->value,
                         'unit' => $metric->unit,
                         'status' => $metric->status,
-                        'category' => $metric->category
+                        'category' => $metric->category,
+                        'subcategory' => $metric->subcategory,
+                        'measured_at' => $metric->measured_at->toISOString(),
+                        'source' => $metric->source,
+                        'context' => $metric->context,
+                        'reference_range' => $this->getReferenceRangeForMetric($metric->type),
+                        'is_new' => true, // Mark as new for review badge
+                        'needs_review' => true, // Enable review badge
                     ];
                 })
             ];
@@ -191,7 +215,8 @@ class ReportController extends Controller
             Log::info('Report upload completed', [
                 'report_id' => $report->id,
                 'ocr_status' => $report->ocr_status,
-                'metrics_created' => count($createdMetrics)
+                'metrics_created' => count($createdMetrics),
+                'categories_found' => $this->getMetricCategories($createdMetrics)
             ]);
 
             return response()->json($response, 201);
@@ -210,6 +235,105 @@ class ReportController extends Controller
         }
     }
 
+    /**
+     * Format extracted metrics summary for response
+     */
+    private function formatExtractedMetricsSummary($metrics)
+    {
+        if (empty($metrics)) {
+            return 'No health metrics extracted from this report.';
+        }
+
+        $count = count($metrics);
+        $categories = collect($metrics)->groupBy('category')->keys()->filter()->values();
+        
+        if ($categories->count() > 1) {
+            return "Extracted {$count} health metrics across " . $categories->count() . " categories: " . $categories->join(', ');
+        } else if ($categories->count() === 1) {
+            return "Extracted {$count} health metrics from {$categories->first()} tests";
+        } else {
+            return "Extracted {$count} health metrics from your report";
+        }
+    }
+
+    /**
+     * Get unique categories from extracted metrics
+     */
+    private function getMetricCategories($metrics)
+    {
+        return collect($metrics)
+            ->pluck('category')
+            ->filter()
+            ->unique()
+            ->values()
+            ->toArray();
+    }
+
+    /**
+     * Get display name for metric type
+     */
+    private function getMetricDisplayName($type)
+    {
+        $displayNames = [
+            'hdl' => 'HDL Cholesterol',
+            'ldl' => 'LDL Cholesterol',
+            'total_cholesterol' => 'Total Cholesterol',
+            'triglycerides' => 'Triglycerides',
+            'vitamin_d' => 'Vitamin D',
+            'vitamin_b12' => 'Vitamin B12',
+            'folate' => 'Folate',
+            'iron' => 'Iron',
+            'ferritin' => 'Ferritin',
+            'hemoglobin' => 'Hemoglobin',
+            'hematocrit' => 'Hematocrit',
+            'glucose_fasting' => 'Fasting Glucose',
+            'hba1c' => 'HbA1c',
+            'creatinine' => 'Creatinine',
+            'blood_urea_nitrogen' => 'Blood Urea Nitrogen',
+            'alt' => 'ALT',
+            'ast' => 'AST',
+            'tsh' => 'TSH',
+            'blood_pressure' => 'Blood Pressure'
+        ];
+
+        return $displayNames[$type] ?? ucwords(str_replace('_', ' ', $type));
+    }
+
+    /**
+     * Get reference range for a specific metric type
+     */
+    private function getReferenceRangeForMetric($type)
+    {
+        $ranges = HealthMetric::getReferenceRanges($type);
+        
+        if (!$ranges || (!isset($ranges['min']) && !isset($ranges['max']))) {
+            return null;
+        }
+
+        return [
+            'min' => $ranges['min'] ?? null,
+            'max' => $ranges['max'] ?? null,
+            'unit' => $ranges['unit'] ?? '',
+            'display' => $this->formatReferenceRangeDisplay($ranges)
+        ];
+    }
+
+    /**
+     * Format reference range for display
+     */
+    private function formatReferenceRangeDisplay($ranges)
+    {
+        if (isset($ranges['min']) && isset($ranges['max'])) {
+            return "{$ranges['min']} - {$ranges['max']} {$ranges['unit']}";
+        } else if (isset($ranges['max'])) {
+            return "< {$ranges['max']} {$ranges['unit']}";
+        } else if (isset($ranges['min'])) {
+            return "> {$ranges['min']} {$ranges['unit']}";
+        }
+        
+        return 'Reference range not available';
+    }
+    
     /**
      * Clean text for database storage
      */

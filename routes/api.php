@@ -50,17 +50,22 @@ Route::middleware(['auth:sanctum'])->prefix('doctor')->group(function () {
     Route::get('/reports/{id}', [PatientReportController::class, 'show']);
 });
 
-// Health metrics routes (protected)
+// ✨ Enhanced Health metrics routes (protected)
 Route::middleware('auth:sanctum')->prefix('patient')->group(function () {
+    // Core metrics functionality
     Route::post('/metrics', [HealthMetricsController::class, 'store']);
     Route::get('/metrics', [HealthMetricsController::class, 'index']);
     Route::get('/metrics/trends/{type}', [HealthMetricsController::class, 'trends']);
     Route::delete('/metrics/{id}', [HealthMetricsController::class, 'destroy']);
     Route::get('/metrics/insights', [HealthMetricsController::class, 'insights']);
     Route::get('/metrics/categorized', [HealthMetricsController::class, 'categorizedMetrics']);
+    
+    // ✨ Enhanced metrics routes
+    Route::get('/metrics/recent', [HealthMetricsController::class, 'getRecentMetrics']);
+    Route::post('/metrics/mark-reviewed', [HealthMetricsController::class, 'markAsReviewed']);
 });
 
-// 📁 Patient report routes (protected) - ENHANCED with OCR functionality
+// ✨ Enhanced Patient report routes (protected) - ENHANCED with OCR functionality
 Route::middleware('auth:sanctum')->prefix('patient')->group(function () {
     // Core report management
     Route::post('/reports', [ReportController::class, 'upload']);

@@ -191,4 +191,4 @@ return [
         'fallback_to_tesseract' => env('GOOGLE_VISION_FALLBACK', true),
         'confidence_threshold' => env('GOOGLE_VISION_CONFIDENCE', 0.8),
     ],
-];php artisan tinker
+];

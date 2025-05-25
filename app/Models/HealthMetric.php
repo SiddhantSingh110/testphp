@@ -368,43 +368,199 @@ class HealthMetric extends Model
         }
     }
     
-    /**
-     * Create metrics from AI report extraction
-     * This method handles bulk creation from medical reports
+     /**
+     * Enhanced: Create metrics from AI report extraction
+     * This method handles bulk creation from medical reports with better metadata
      */
-    public static function createFromAIExtraction($patientId, $extractedData)
+    public static function createFromAIExtraction($patientId, $extractedData, $reportDate = null, $reportId = null)
     {
         $createdMetrics = [];
+        $reportDate = $reportDate ?? now();
         
         foreach ($extractedData as $data) {
+            // Clean and normalize parameter name
             $parameterName = strtolower(str_replace([' ', '-', '(', ')'], '_', $data['parameter']));
             
+            // Create the metric with enhanced metadata
             $metric = new self([
                 'patient_id' => $patientId,
                 'type' => $parameterName,
                 'value' => $data['value'],
                 'unit' => $data['unit'] ?? 'unknown',
-                'measured_at' => now(),
+                'measured_at' => $reportDate,
                 'source' => 'report',
                 'context' => 'medical_test',
-                'notes' => 'Auto-extracted from medical report'
+                'notes' => $reportId ? "Auto-extracted from medical report (ID: {$reportId})" : 'Auto-extracted from medical report'
             ]);
             
-            // Auto-populate categories
+            // Auto-populate categories using existing method
             $metric->setMetricCategories();
             
-            // Calculate status
+            // Calculate status using existing method
             $metric->status = $metric->calculateStatus();
             
-            $metric->save();
-            $createdMetrics[] = $metric;
+            try {
+                $metric->save();
+                $createdMetrics[] = $metric;
+                
+                \Log::info('Health metric created from report extraction', [
+                    'patient_id' => $patientId,
+                    'metric_type' => $parameterName,
+                    'value' => $data['value'],
+                    'unit' => $data['unit'] ?? 'unknown',
+                    'status' => $metric->status,
+                    'category' => $metric->category,
+                    'report_id' => $reportId
+                ]);
+                
+            } catch (\Exception $e) {
+                \Log::error('Failed to create health metric from extraction', [
+                    'patient_id' => $patientId,
+                    'metric_type' => $parameterName,
+                    'error' => $e->getMessage(),
+                    'data' => $data
+                ]);
+            }
         }
+        
+        \Log::info('Completed health metrics extraction', [
+            'patient_id' => $patientId,
+            'total_extracted' => count($extractedData),
+            'successfully_created' => count($createdMetrics),
+            'report_id' => $reportId
+        ]);
         
         return $createdMetrics;
     }
-    
-    public function patient()
+     /**
+     * Get all metrics for a patient with enhanced filtering and metadata
+     */
+    public static function getPatientMetricsWithMetadata($patientId, $filters = [])
     {
-        return $this->belongsTo(Patient::class);
+        $query = self::where('patient_id', $patientId);
+        
+        // Apply filters
+        if (isset($filters['type'])) {
+            $query->where('type', $filters['type']);
+        }
+        
+        if (isset($filters['category'])) {
+            $query->where('category', $filters['category']);
+        }
+        
+        if (isset($filters['subcategory'])) {
+            $query->where('subcategory', $filters['subcategory']);
+        }
+        
+        if (isset($filters['source'])) {
+            $query->where('source', $filters['source']);
+        }
+        
+        if (isset($filters['status'])) {
+            $query->where('status', $filters['status']);
+        }
+        
+        if (isset($filters['from_date'])) {
+            $query->where('measured_at', '>=', $filters['from_date']);
+        }
+        
+        if (isset($filters['to_date'])) {
+            $query->where('measured_at', '<=', $filters['to_date']);
+        }
+        
+        $metrics = $query->orderBy('measured_at', 'desc')->get();
+        
+        // Group metrics by type and add metadata
+        $groupedMetrics = [];
+        
+        foreach ($metrics as $metric) {
+            $metricType = $metric->type;
+            
+            // Enhanced metric data with all metadata
+            $transformedMetric = [
+                'id' => $metric->id,
+                'value' => $metric->value,
+                'date' => $metric->measured_at->format('Y-m-d'),
+                'time' => $metric->measured_at->format('H:i A'),
+                'status' => $metric->status,
+                'source' => $metric->source,
+                'context' => $metric->context,
+                'notes' => $metric->notes,
+                'unit' => $metric->unit,
+                'category' => $metric->category,
+                'subcategory' => $metric->subcategory,
+                
+                // Enhanced metadata
+                'display_name' => self::getDisplayName($metric->type),
+                'source_display' => self::getSourceDisplay($metric->source),
+                'is_from_report' => $metric->source === 'report',
+                'reference_range' => self::getReferenceRanges($metric->type),
+                'created_at' => $metric->created_at->toISOString(),
+                
+                // Check if metric is recent (within last 7 days for review badge)
+                'is_recent' => $metric->created_at->diffInDays(now()) <= 7,
+                'needs_review' => $metric->source === 'report' && $metric->created_at->diffInDays(now()) <= 7,
+            ];
+            
+            // Group by metric type
+            if (!isset($groupedMetrics[$metricType])) {
+                $groupedMetrics[$metricType] = [];
+            }
+            
+            $groupedMetrics[$metricType][] = $transformedMetric;
+        }
+        
+        // Sort each group by date (most recent first)
+        foreach ($groupedMetrics as $type => $typeMetrics) {
+            usort($groupedMetrics[$type], function($a, $b) {
+                return strtotime($b['date'] . ' ' . $b['time']) - strtotime($a['date'] . ' ' . $a['time']);
+            });
+        }
+        
+        return $groupedMetrics;
+    }
+    
+    /**
+     * Get display name for metric type
+     */
+    public static function getDisplayName($type)
+    {
+        $displayNames = [
+            'hdl' => 'HDL Cholesterol',
+            'ldl' => 'LDL Cholesterol',
+            'total_cholesterol' => 'Total Cholesterol',
+            'triglycerides' => 'Triglycerides',
+            'vitamin_d' => 'Vitamin D',
+            'vitamin_b12' => 'Vitamin B12',
+            'folate' => 'Folate',
+            'iron' => 'Iron',
+            'ferritin' => 'Ferritin',
+            'hemoglobin' => 'Hemoglobin',
+            'hematocrit' => 'Hematocrit',
+            'glucose_fasting' => 'Fasting Glucose',
+            'hba1c' => 'HbA1c',
+            'creatinine' => 'Creatinine',
+            'blood_urea_nitrogen' => 'Blood Urea Nitrogen',
+            'alt' => 'ALT',
+            'ast' => 'AST',
+            'tsh' => 'TSH',
+            'blood_pressure' => 'Blood Pressure'
+        ];
+
+        return $displayNames[$type] ?? ucwords(str_replace('_', ' ', $type));
+    }
+    
+    /**
+     * Get source display text
+     */
+    public static function getSourceDisplay($source)
+    {
+        $sourceDisplay = [
+            'manual' => 'Manual Entry',
+            'report' => 'Medical Report',
+            'device' => 'Connected Device'
+        ];
+        
+        return $sourceDisplay[$source] ?? ucfirst($source);
     }
 }

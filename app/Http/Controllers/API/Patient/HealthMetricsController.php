@@ -58,80 +58,186 @@ class HealthMetricsController extends Controller
     }
     
     /**
-     * Get all metrics for the authenticated patient
-     * Returns data grouped by metric type as expected by React Native
+     * Enhanced: Get all metrics for the authenticated patient
+     * Returns data grouped by metric type with enhanced metadata
      */
     public function index(Request $request)
     {
         $patientId = auth()->id();
         
-        $query = HealthMetric::where('patient_id', $patientId);
+        // Build filters from request
+        $filters = array_filter([
+            'type' => $request->input('type'),
+            'category' => $request->input('category'),
+            'subcategory' => $request->input('subcategory'),
+            'status' => $request->input('status'),
+            'source' => $request->input('source'),
+            'from_date' => $request->input('from_date'),
+            'to_date' => $request->input('to_date'),
+        ]);
         
-        // Apply filters
-        if ($request->has('type')) {
-            $query->where('type', $request->type);
-        }
+        // Get metrics with enhanced metadata
+        $groupedMetrics = HealthMetric::getPatientMetricsWithMetadata($patientId, $filters);
         
-        if ($request->has('category')) {
-            $query->where('category', $request->category);
-        }
+        // Add summary statistics
+        $totalMetrics = 0;
+        $recentMetrics = 0;
+        $categorySummary = [];
+        $sourceSummary = ['manual' => 0, 'report' => 0, 'device' => 0];
         
-        if ($request->has('subcategory')) {
-            $query->where('subcategory', $request->subcategory);
-        }
-        
-        if ($request->has('status')) {
-            $query->where('status', $request->status);
-        }
-        
-        if ($request->has('from_date')) {
-            $query->where('measured_at', '>=', $request->from_date);
-        }
-        
-        if ($request->has('to_date')) {
-            $query->where('measured_at', '<=', $request->to_date);
-        }
-        
-        $metrics = $query->orderBy('measured_at', 'desc')->get();
-        
-        // Group metrics by type and transform for React Native
-        $groupedMetrics = [];
-        
-        foreach ($metrics as $metric) {
-            $metricType = $metric->type;
+        foreach ($groupedMetrics as $type => $metrics) {
+            $totalMetrics += count($metrics);
             
-            // Transform metric data to match React Native expectations
-            $transformedMetric = [
-                'id' => $metric->id,
-                'value' => $metric->value,
-                'date' => $metric->measured_at->format('Y-m-d'),
-                'time' => $metric->measured_at->format('H:i A'),
-                'status' => $metric->status,
-                'source' => $metric->source,
-                'context' => $metric->context,
-                'notes' => $metric->notes,
-                'unit' => $metric->unit,
-                'category' => $metric->category,
-                'subcategory' => $metric->subcategory
-            ];
+            foreach ($metrics as $metric) {
+                // Count recent metrics (for review badges)
+                if ($metric['is_recent']) {
+                    $recentMetrics++;
+                }
+                
+                // Count by category
+                if ($metric['category']) {
+                    $categorySummary[$metric['category']] = ($categorySummary[$metric['category']] ?? 0) + 1;
+                }
+                
+                // Count by source
+                $sourceSummary[$metric['source']] = ($sourceSummary[$metric['source']] ?? 0) + 1;
+            }
+        }
+        
+        // Return enhanced response
+        return response()->json([
+            // Main data (grouped metrics)
+            'metrics' => $groupedMetrics,
             
-            // Group by metric type
-            if (!isset($groupedMetrics[$metricType])) {
-                $groupedMetrics[$metricType] = [];
+            // Summary statistics
+            'summary' => [
+                'total_metrics' => $totalMetrics,
+                'recent_metrics' => $recentMetrics,
+                'metrics_by_category' => $categorySummary,
+                'metrics_by_source' => $sourceSummary,
+                'unique_metric_types' => count($groupedMetrics),
+            ],
+            
+            // UI hints
+            'ui_hints' => [
+                'has_new_metrics' => $recentMetrics > 0,
+                'show_review_badges' => $recentMetrics > 0,
+                'has_report_metrics' => $sourceSummary['report'] > 0,
+                'categories_available' => array_keys($categorySummary),
+            ],
+            
+            // Metadata
+            'filters_applied' => $filters,
+            'generated_at' => now()->toISOString(),
+        ]);
+    }
+    
+    /**
+     * Enhanced: Get recent health metrics summary
+     * Useful for showing "What's New" sections
+     */
+    public function getRecentMetrics(Request $request)
+    {
+        $patientId = auth()->id();
+        $days = $request->input('days', 7); // Default to last 7 days
+        
+        $recentMetrics = HealthMetric::where('patient_id', $patientId)
+            ->where('created_at', '>=', now()->subDays($days))
+            ->orderBy('created_at', 'desc')
+            ->get();
+        
+        // Group by date and source
+        $groupedByDate = $recentMetrics->groupBy(function($metric) {
+            return $metric->created_at->format('Y-m-d');
+        });
+        
+        $groupedBySource = $recentMetrics->groupBy('source');
+        
+        // Format for timeline display
+        $timeline = [];
+        foreach ($groupedByDate as $date => $metrics) {
+            $reportMetrics = $metrics->where('source', 'report');
+            $manualMetrics = $metrics->where('source', 'manual');
+            
+            if ($reportMetrics->count() > 0) {
+                $timeline[] = [
+                    'date' => $date,
+                    'type' => 'report_extraction',
+                    'title' => 'Medical Report Analysis',
+                    'subtitle' => $reportMetrics->count() . ' new health metrics extracted',
+                    'metrics' => $reportMetrics->map(function($metric) {
+                        return [
+                            'type' => $metric->type,
+                            'display_name' => HealthMetric::getDisplayName($metric->type),
+                            'value' => $metric->value,
+                            'unit' => $metric->unit,
+                            'status' => $metric->status,
+                        ];
+                    })->values(),
+                    'icon' => 'document-text',
+                    'color' => '#38BFA7',
+                ];
             }
             
-            $groupedMetrics[$metricType][] = $transformedMetric;
+            if ($manualMetrics->count() > 0) {
+                $timeline[] = [
+                    'date' => $date,
+                    'type' => 'manual_entry',
+                    'title' => 'Manual Entries',
+                    'subtitle' => $manualMetrics->count() . ' metrics added manually',
+                    'metrics' => $manualMetrics->map(function($metric) {
+                        return [
+                            'type' => $metric->type,
+                            'display_name' => HealthMetric::getDisplayName($metric->type),
+                            'value' => $metric->value,
+                            'unit' => $metric->unit,
+                            'status' => $metric->status,
+                        ];
+                    })->values(),
+                    'icon' => 'create',
+                    'color' => '#2C7BE5',
+                ];
+            }
         }
         
-        // Sort each group by date (most recent first)
-        foreach ($groupedMetrics as $type => $typeMetrics) {
-            usort($groupedMetrics[$type], function($a, $b) {
-                return strtotime($b['date'] . ' ' . $b['time']) - strtotime($a['date'] . ' ' . $a['time']);
-            });
+        return response()->json([
+            'timeline' => $timeline,
+            'summary' => [
+                'total_recent' => $recentMetrics->count(),
+                'from_reports' => $groupedBySource->get('report', collect())->count(),
+                'manual_entries' => $groupedBySource->get('manual', collect())->count(),
+                'days_covered' => $days,
+            ],
+        ]);
+    }
+    
+    /**
+     * Mark metrics as reviewed (remove review badges)
+     */
+    public function markAsReviewed(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'metric_ids' => 'required|array',
+            'metric_ids.*' => 'integer|exists:health_metrics,id'
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json(['errors' => $validator->errors()], 422);
         }
+
+        $patientId = auth()->id();
         
-        // Return the grouped data directly (not wrapped in 'metrics' key)
-        return response()->json($groupedMetrics);
+        // Update metrics to add "reviewed" note
+        $updatedCount = HealthMetric::where('patient_id', $patientId)
+            ->whereIn('id', $request->metric_ids)
+            ->update([
+                'notes' => \DB::raw("CONCAT(COALESCE(notes, ''), IF(notes IS NOT NULL AND notes != '', ' | ', ''), 'Reviewed by patient on " . now()->format('Y-m-d') . "')")
+            ]);
+        
+        return response()->json([
+            'message' => 'Metrics marked as reviewed successfully',
+            'updated_count' => $updatedCount,
+        ]);
     }
     
     /**
