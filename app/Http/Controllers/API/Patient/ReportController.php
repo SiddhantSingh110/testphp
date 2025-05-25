@@ -91,7 +91,7 @@ class ReportController extends Controller
             'summary' => $aiSummaryJson,
             'confidence_score' => $aiSummaryJson['confidence_score'] ?? null,
             'health_metrics_created' => count($createdMetrics),
-            'created_metrics' => $createdMetrics->map(function($metric) {
+            'created_metrics' => collect($createdMetrics)->map(function($metric) {
                 return [
                     'type' => $metric->type,
                     'value' => $metric->value,

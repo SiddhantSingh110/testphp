@@ -15,7 +15,7 @@ class HealthMetricsController extends Controller
     public function store(Request $request)
     {
         $validator = Validator::make($request->all(), [
-            'type' => 'required|string', // Remove strict validation to allow any parameter name
+            'type' => 'required|string',
             'value' => 'required|string',
             'unit' => 'required|string',
             'measured_at' => 'nullable|date',
@@ -59,6 +59,7 @@ class HealthMetricsController extends Controller
     
     /**
      * Get all metrics for the authenticated patient
+     * Returns data grouped by metric type as expected by React Native
      */
     public function index(Request $request)
     {
@@ -93,17 +94,44 @@ class HealthMetricsController extends Controller
         
         $metrics = $query->orderBy('measured_at', 'desc')->get();
         
-        // Add reference ranges to response
-        $metricsWithRanges = $metrics->map(function ($metric) {
-            $ranges = HealthMetric::getReferenceRanges();
-            $metric->reference_range = $ranges[$metric->type] ?? null;
-            return $metric;
-        });
+        // Group metrics by type and transform for React Native
+        $groupedMetrics = [];
         
-        return response()->json([
-            'metrics' => $metricsWithRanges,
-            'reference_ranges' => HealthMetric::getReferenceRanges()
-        ]);
+        foreach ($metrics as $metric) {
+            $metricType = $metric->type;
+            
+            // Transform metric data to match React Native expectations
+            $transformedMetric = [
+                'id' => $metric->id,
+                'value' => $metric->value,
+                'date' => $metric->measured_at->format('Y-m-d'),
+                'time' => $metric->measured_at->format('H:i A'),
+                'status' => $metric->status,
+                'source' => $metric->source,
+                'context' => $metric->context,
+                'notes' => $metric->notes,
+                'unit' => $metric->unit,
+                'category' => $metric->category,
+                'subcategory' => $metric->subcategory
+            ];
+            
+            // Group by metric type
+            if (!isset($groupedMetrics[$metricType])) {
+                $groupedMetrics[$metricType] = [];
+            }
+            
+            $groupedMetrics[$metricType][] = $transformedMetric;
+        }
+        
+        // Sort each group by date (most recent first)
+        foreach ($groupedMetrics as $type => $typeMetrics) {
+            usort($groupedMetrics[$type], function($a, $b) {
+                return strtotime($b['date'] . ' ' . $b['time']) - strtotime($a['date'] . ' ' . $a['time']);
+            });
+        }
+        
+        // Return the grouped data directly (not wrapped in 'metrics' key)
+        return response()->json($groupedMetrics);
     }
     
     /**
@@ -113,8 +141,8 @@ class HealthMetricsController extends Controller
     {
         $patientId = auth()->id();
         
-        // Validate type - now accepts any parameter name
-        if (empty($request->type) || strlen($request->type) > 100) {
+        // Validate type
+        if (empty($type) || strlen($type) > 100) {
             return response()->json(['error' => 'Invalid parameter type'], 400);
         }
         

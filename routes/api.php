@@ -56,6 +56,8 @@ Route::middleware('auth:sanctum')->prefix('patient')->group(function () {
     Route::get('/metrics', [HealthMetricsController::class, 'index']);
     Route::get('/metrics/trends/{type}', [HealthMetricsController::class, 'trends']);
     Route::delete('/metrics/{id}', [HealthMetricsController::class, 'destroy']);
+    Route::get('/metrics/insights', [HealthMetricsController::class, 'insights']);
+    Route::get('/metrics/categorized', [HealthMetricsController::class, 'categorizedMetrics']);
 });
 
 // Patient report routes (protected)
