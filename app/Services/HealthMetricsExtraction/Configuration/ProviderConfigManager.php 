@@ -4,6 +4,7 @@ namespace App\Services\HealthMetricsExtraction\Configuration;
 
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Log;
 use App\Services\HealthMetricsExtraction\Exceptions\ConfigurationException;
 
@@ -22,6 +23,7 @@ class ProviderConfigManager
         $this->configTable = $this->defaultConfig['runtime_config']['table'] ?? 'health_metrics_config';
         $this->cacheTtl = $this->defaultConfig['runtime_config']['cache_ttl'] ?? 3600;
         
+        $this->ensureConfigTableExists();
         $this->loadRuntimeConfig();
     }
 
@@ -116,69 +118,7 @@ class ProviderConfigManager
     }
 
     /**
-     * Check if runtime configuration is enabled
-     */
-    protected function isRuntimeConfigEnabled(): bool
-    {
-        return $this->defaultConfig['runtime_config']['enabled'] ?? true;
-    }
-
-    /**
-     * Get cache key for runtime configuration
-     */
-    protected function getCacheKey(): string
-    {
-        return $this->cachePrefix . ':runtime_config';
-    }
-
-    /**
-     * Get timestamp of last configuration update
-     */
-    protected function getLastConfigUpdate(): ?string
-    {
-        if (!$this->isRuntimeConfigEnabled()) {
-            return null;
-        }
-
-        try {
-            $lastUpdate = DB::table($this->configTable)
-                ->max('updated_at');
-            
-            return $lastUpdate;
-        } catch (\Exception $e) {
-            return null;
-        }
-    }
-
-    /**
-     * Create the runtime configuration table if it doesn't exist
-     */
-    public function ensureConfigTableExists(): void
-    {
-        if (!$this->isRuntimeConfigEnabled()) {
-            return;
-        }
-
-        try {
-            if (!DB::getSchemaBuilder()->hasTable($this->configTable)) {
-                DB::getSchemaBuilder()->create($this->configTable, function($table) {
-                    $table->id();
-                    $table->string('key')->unique();
-                    $table->text('value');
-                    $table->timestamp('updated_at')->useCurrent();
-                    $table->index('key');
-                });
-                
-                Log::info("Created health metrics configuration table: {$this->configTable}");
-            }
-        } catch (\Exception $e) {
-            Log::error("Failed to create configuration table", [
-                'table' => $this->configTable,
-                'error' => $e->getMessage()
-            ]);
-        }
-    }
-} if fallback is enabled
+     * Check if fallback is enabled
      */
     public function isFallbackEnabled(): bool
     {
@@ -287,35 +227,66 @@ class ProviderConfigManager
     }
 
     /**
-     * Validate that a provider exists in configuration
+     * Check if runtime configuration is enabled
      */
-    protected function validateProvider(string $provider): void
+    protected function isRuntimeConfigEnabled(): bool
     {
-        if (!isset($this->defaultConfig['providers'][$provider])) {
-            throw new ConfigurationException("Unknown provider: {$provider}");
+        return $this->defaultConfig['runtime_config']['enabled'] ?? true;
+    }
+
+    /**
+     * Get cache key for runtime configuration
+     */
+    protected function getCacheKey(): string
+    {
+        return $this->cachePrefix . ':runtime_config';
+    }
+
+    /**
+     * Get timestamp of last configuration update
+     */
+    protected function getLastConfigUpdate(): ?string
+    {
+        if (!$this->isRuntimeConfigEnabled()) {
+            return null;
+        }
+
+        try {
+            $lastUpdate = DB::table($this->configTable)
+                ->max('updated_at');
+            
+            return $lastUpdate;
+        } catch (\Exception $e) {
+            return null;
         }
     }
 
     /**
-     * Check if a provider is properly configured
+     * Create the runtime configuration table if it doesn't exist
      */
-    protected function isProviderConfigured(string $provider, array $config): bool
+    public function ensureConfigTableExists(): void
     {
-        // Check for required fields
-        if (empty($config['api_key'])) {
-            return false;
+        if (!$this->isRuntimeConfigEnabled()) {
+            return;
         }
-        
-        // Provider-specific checks
-        switch ($provider) {
-            case 'claude':
-                return !empty($config['base_url']) && !empty($config['model']);
-            case 'deepseek':
-                return !empty($config['base_url']) && !empty($config['model']);
-            case 'openai':
-                return !empty($config['model']);
-            default:
-                return true;
+
+        try {
+            if (!Schema::hasTable($this->configTable)) {
+                Schema::create($this->configTable, function($table) {
+                    $table->id();
+                    $table->string('key')->unique();
+                    $table->text('value');
+                    $table->timestamp('updated_at')->useCurrent();
+                    $table->index('key');
+                });
+                
+                Log::info("Created health metrics configuration table: {$this->configTable}");
+            }
+        } catch (\Exception $e) {
+            Log::error("Failed to create configuration table", [
+                'table' => $this->configTable,
+                'error' => $e->getMessage()
+            ]);
         }
     }
 
@@ -389,4 +360,35 @@ class ProviderConfigManager
     }
 
     /**
-     * Check
+     * Validate that a provider exists in configuration
+     */
+    protected function validateProvider(string $provider): void
+    {
+        if (!isset($this->defaultConfig['providers'][$provider])) {
+            throw new ConfigurationException("Unknown provider: {$provider}");
+        }
+    }
+
+    /**
+     * Check if a provider is properly configured
+     */
+    protected function isProviderConfigured(string $provider, array $config): bool
+    {
+        // Check for required fields
+        if (empty($config['api_key'])) {
+            return false;
+        }
+        
+        // Provider-specific checks
+        switch ($provider) {
+            case 'claude':
+                return !empty($config['base_url']) && !empty($config['model']);
+            case 'deepseek':
+                return !empty($config['base_url']) && !empty($config['model']);
+            case 'openai':
+                return !empty($config['model']);
+            default:
+                return true;
+        }
+    }
+}
