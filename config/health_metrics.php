@@ -3,16 +3,17 @@
 return [
     /*
     |--------------------------------------------------------------------------
-    | Primary AI Provider Configuration
+    | Primary AI Provider Configuration - ENV File Based Control
     |--------------------------------------------------------------------------
     |
-    | This determines which AI provider is used first for health metrics
-    | extraction. Can be overridden at runtime via admin API.
+    | Change PRIMARY_AI_PROVIDER and SECONDARY_AI_PROVIDER in .env file
+    | to switch providers without touching admin panel or web UI.
     |
     | Supported: "deepseek", "claude", "openai"
     |
     */
-    'primary_provider' => env('HEALTH_METRICS_PRIMARY_PROVIDER', 'deepseek'),
+    'primary_provider' => env('PRIMARY_AI_PROVIDER', 'deepseek'),
+    'secondary_provider' => env('SECONDARY_AI_PROVIDER', 'claude'),
 
     /*
     |--------------------------------------------------------------------------
@@ -32,7 +33,7 @@ return [
     |--------------------------------------------------------------------------
     |
     | Configure each AI provider with their specific settings.
-    | Priority determines fallback order (1 = highest priority).
+    | Priority is now controlled by PRIMARY_AI_PROVIDER and SECONDARY_AI_PROVIDER
     |
     */
     'providers' => [
@@ -41,7 +42,7 @@ return [
             'api_key' => env('DEEPSEEK_API_KEY'),
             'base_url' => env('DEEPSEEK_BASE_URL', 'https://api.deepseek.com'),
             'model' => env('DEEPSEEK_MODEL', 'deepseek-chat'),
-            'priority' => 1,
+            'priority' => 1, // Will be overridden by ENV-based logic
             'timeout' => env('DEEPSEEK_TIMEOUT', 30),
             'max_retries' => env('DEEPSEEK_MAX_RETRIES', 3),
             'features' => [
@@ -57,7 +58,7 @@ return [
             'base_url' => env('CLAUDE_BASE_URL', 'https://api.anthropic.com/v1'),
             'model' => env('CLAUDE_MODEL', 'claude-3-5-sonnet-20241022'),
             'anthropic_version' => env('CLAUDE_ANTHROPIC_VERSION', '2023-06-01'),
-            'priority' => 2,
+            'priority' => 2, // Will be overridden by ENV-based logic
             'timeout' => env('CLAUDE_TIMEOUT', 30),
             'max_retries' => env('CLAUDE_MAX_RETRIES', 3),
             'features' => [
@@ -72,7 +73,7 @@ return [
             'enabled' => env('OPENAI_ENABLED', true),
             'api_key' => env('OPENAI_API_KEY'),
             'model' => env('OPENAI_MODEL', 'gpt-4'),
-            'priority' => 3,
+            'priority' => 3, // Will be overridden by ENV-based logic
             'timeout' => env('OPENAI_TIMEOUT', 30),
             'max_retries' => env('OPENAI_MAX_RETRIES', 3),
             'features' => [
@@ -105,12 +106,14 @@ return [
     |--------------------------------------------------------------------------
     |
     | Settings for storing runtime configuration changes in database.
+    | NOTE: ENV file settings will override database settings
     |
     */
     'runtime_config' => [
         'enabled' => env('HEALTH_METRICS_RUNTIME_CONFIG', true),
         'table' => 'health_metrics_config',
         'cache_ttl' => 3600, // 1 hour
+        'env_override' => true, // ENV variables take precedence
     ],
 
     /*
@@ -158,7 +161,7 @@ return [
     'admin' => [
         'enable_admin_api' => env('HEALTH_METRICS_ENABLE_ADMIN_API', true),
         'admin_routes_middleware' => ['auth:sanctum', 'admin'], // Customize as needed
-        'allow_runtime_provider_switch' => env('HEALTH_METRICS_ALLOW_RUNTIME_SWITCH', true),
+        'allow_runtime_provider_switch' => env('HEALTH_METRICS_ALLOW_RUNTIME_SWITCH', false), // Disabled since using ENV
         'log_admin_actions' => env('HEALTH_METRICS_LOG_ADMIN_ACTIONS', true),
     ],
 
@@ -176,5 +179,6 @@ return [
         'automatic_provider_switching' => env('HEALTH_METRICS_AUTO_SWITCH', false), // Future feature
         'metrics_caching' => env('HEALTH_METRICS_CACHING', true),
         'performance_analytics' => env('HEALTH_METRICS_ANALYTICS', true),
+        'env_based_switching' => true, // New feature - ENV file based switching
     ],
 ];

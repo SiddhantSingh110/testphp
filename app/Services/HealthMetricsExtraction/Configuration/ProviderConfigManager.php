@@ -28,13 +28,33 @@ class ProviderConfigManager
     }
 
     /**
-     * Get the current primary provider
+     * Get the current primary provider - ENV file takes precedence
      */
     public function getPrimaryProvider(): string
     {
+        // ENV file override takes highest precedence
+        if ($this->defaultConfig['runtime_config']['env_override'] ?? true) {
+            return $this->defaultConfig['primary_provider'] ?? 'deepseek';
+        }
+        
+        // Fallback to runtime config if ENV override is disabled
         return $this->getRuntimeConfig('primary_provider') 
             ?? $this->defaultConfig['primary_provider'] 
             ?? 'deepseek';
+    }
+
+    /**
+     * Get the secondary provider from ENV configuration
+     */
+    public function getSecondaryProvider(): ?string
+    {
+        // ENV file override takes highest precedence
+        if ($this->defaultConfig['runtime_config']['env_override'] ?? true) {
+            return $this->defaultConfig['secondary_provider'] ?? null;
+        }
+        
+        // Fallback to runtime config if ENV override is disabled
+        return $this->getRuntimeConfig('secondary_provider') ?? null;
     }
 
     /**
@@ -94,12 +114,13 @@ class ProviderConfigManager
     }
 
     /**
-     * Get providers in fallback order, with primary provider first
+     * Get providers in fallback order, with ENV-based primary and secondary first
      */
     public function getProvidersInFallbackOrder(): array
     {
         $providers = $this->getAvailableProviders();
         $primaryProvider = $this->getPrimaryProvider();
+        $secondaryProvider = $this->getSecondaryProvider();
         
         $ordered = [];
         
@@ -107,6 +128,12 @@ class ProviderConfigManager
         if (isset($providers[$primaryProvider])) {
             $ordered[$primaryProvider] = $providers[$primaryProvider];
             unset($providers[$primaryProvider]);
+        }
+        
+        // Add secondary provider second if it exists and is available
+        if ($secondaryProvider && isset($providers[$secondaryProvider])) {
+            $ordered[$secondaryProvider] = $providers[$secondaryProvider];
+            unset($providers[$secondaryProvider]);
         }
         
         // Add remaining providers in priority order
@@ -191,10 +218,13 @@ class ProviderConfigManager
         
         return [
             'primary_provider' => $this->getPrimaryProvider(),
+            'secondary_provider' => $this->getSecondaryProvider(),
             'fallback_enabled' => $this->isFallbackEnabled(),
             'stop_on_first_success' => $this->shouldStopOnFirstSuccess(),
             'available_providers' => array_keys($providers),
             'provider_count' => count($providers),
+            'configuration_source' => ($this->defaultConfig['runtime_config']['env_override'] ?? true) ? 'ENV File' : 'Database',
+            'env_override_enabled' => $this->defaultConfig['runtime_config']['env_override'] ?? true,
             'provider_details' => array_map(function($config) {
                 return [
                     'enabled' => $config['enabled'] ?? false,

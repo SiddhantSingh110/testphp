@@ -28,7 +28,7 @@ class HealthMetricsExtractionService
     }
 
     /**
-     * Extract health metrics from raw medical text with multi-provider fallback
+     * Extract health metrics from raw medical text with ENV-based multi-provider fallback
      *
      * @param string $rawText Medical report text
      * @param array $aiSummaryJson Optional AI summary JSON
@@ -41,12 +41,17 @@ class HealthMetricsExtractionService
         $startTime = microtime(true);
         $context = $this->buildExtractionContext($aiSummaryJson, $patientId, $report);
         
-        Log::info("Starting multi-provider health metrics extraction", [
+        $primaryProvider = $this->configManager->getPrimaryProvider();
+        $secondaryProvider = $this->configManager->getSecondaryProvider();
+        
+        Log::info("Starting ENV-based multi-provider health metrics extraction", [
             'report_id' => $report->id,
             'patient_id' => $patientId,
             'text_length' => strlen($rawText),
-            'primary_provider' => $this->configManager->getPrimaryProvider(),
-            'fallback_enabled' => $this->configManager->isFallbackEnabled()
+            'primary_provider' => $primaryProvider,
+            'secondary_provider' => $secondaryProvider,
+            'fallback_enabled' => $this->configManager->isFallbackEnabled(),
+            'configuration_source' => 'ENV File'
         ]);
 
         $providersToTry = $this->getProvidersToTry();
@@ -79,9 +84,11 @@ class HealthMetricsExtractionService
                 
                 $totalDuration = round((microtime(true) - $startTime) * 1000, 2);
                 
-                Log::info("Health metrics extraction successful", [
+                Log::info("ENV-based health metrics extraction successful", [
                     'report_id' => $report->id,
                     'provider_used' => $providerName,
+                    'is_primary' => $providerName === $primaryProvider,
+                    'is_secondary' => $providerName === $secondaryProvider,
                     'metrics_extracted' => count($extractedMetrics['metrics']),
                     'categories_found' => count($extractedMetrics['categories_found']),
                     'provider_duration_ms' => $providerDuration,
@@ -98,7 +105,10 @@ class HealthMetricsExtractionService
                     'ai_response' => $aiResponse,
                     'duration_ms' => $totalDuration,
                     'provider_duration_ms' => $providerDuration,
-                    'attempts_made' => count($extractionResults) + 1
+                    'attempts_made' => count($extractionResults) + 1,
+                    'configuration_source' => 'ENV File',
+                    'primary_provider' => $primaryProvider,
+                    'secondary_provider' => $secondaryProvider
                 ];
 
             } catch (ProviderException $e) {
@@ -113,11 +123,13 @@ class HealthMetricsExtractionService
                     'retryable' => $e->isRetryable()
                 ];
 
-                Log::warning("Provider {$providerName} failed", [
+                Log::warning("ENV-based provider {$providerName} failed", [
                     'report_id' => $report->id,
                     'error' => $e->getMessage(),
                     'retryable' => $e->isRetryable(),
-                    'duration_ms' => $providerDuration
+                    'duration_ms' => $providerDuration,
+                    'is_primary' => $providerName === $primaryProvider,
+                    'is_secondary' => $providerName === $secondaryProvider
                 ]);
 
                 // If fallback is disabled or this was the last provider, break
@@ -140,7 +152,7 @@ class HealthMetricsExtractionService
                     'retryable' => true
                 ];
 
-                Log::error("Unexpected error with provider {$providerName}", [
+                Log::error("Unexpected error with ENV-based provider {$providerName}", [
                     'report_id' => $report->id,
                     'error' => $e->getMessage(),
                     'trace' => $e->getTraceAsString()
@@ -157,9 +169,11 @@ class HealthMetricsExtractionService
         // All providers failed
         $totalDuration = round((microtime(true) - $startTime) * 1000, 2);
         
-        Log::error("All providers failed for health metrics extraction", [
+        Log::error("All ENV-based providers failed for health metrics extraction", [
             'report_id' => $report->id,
             'patient_id' => $patientId,
+            'primary_provider' => $primaryProvider,
+            'secondary_provider' => $secondaryProvider,
             'providers_tried' => array_column($extractionResults, 'provider'),
             'total_duration_ms' => $totalDuration,
             'last_error' => $lastException?->getMessage()
@@ -176,7 +190,10 @@ class HealthMetricsExtractionService
             'duration_ms' => $totalDuration,
             'attempts_made' => count($extractionResults),
             'extraction_attempts' => $extractionResults,
-            'error' => $lastException?->getMessage() ?? 'All providers failed'
+            'error' => $lastException?->getMessage() ?? 'All providers failed',
+            'configuration_source' => 'ENV File',
+            'primary_provider' => $primaryProvider,
+            'secondary_provider' => $secondaryProvider
         ];
     }
 
@@ -422,7 +439,7 @@ class HealthMetricsExtractionService
     }
 
     /**
-     * Get providers to try in order
+     * Get providers to try in ENV-based order (Primary → Secondary → Others)
      */
     protected function getProvidersToTry(): array
     {
@@ -451,7 +468,8 @@ class HealthMetricsExtractionService
         
         Log::info("Initialized health metrics extraction providers", [
             'available_providers' => array_keys($this->providers),
-            'primary_provider' => $this->configManager->getPrimaryProvider()
+            'primary_provider' => $this->configManager->getPrimaryProvider(),
+            'secondary_provider' => $this->configManager->getSecondaryProvider()
         ]);
     }
 
@@ -567,15 +585,17 @@ class HealthMetricsExtractionService
         return [
             'service_status' => 'operational',
             'primary_provider' => $this->configManager->getPrimaryProvider(),
+            'secondary_provider' => $this->configManager->getSecondaryProvider(),
             'fallback_enabled' => $this->configManager->isFallbackEnabled(),
             'providers' => $providers,
             'total_providers' => count($this->providers),
             'configuration_summary' => $this->configManager->getConfigurationSummary()
         ];
     }
+
     /**
- * Extract metrics using a specific provider (for admin switching)
- */
+     * Extract metrics using a specific provider (for admin switching)
+     */
     public function extractMetricsWithSpecificProvider(string $rawText, array $context = [], string $providerName = null): array
     {
         try {
@@ -583,9 +603,9 @@ class HealthMetricsExtractionService
             
             // Get the specific provider
             $provider = match(strtolower($providerName)) {
-                'deepseek' => $this->deepseekProvider,
-                'claude' => $this->claudeProvider,
-                'openai' => $this->openaiProvider,
+                'deepseek' => $this->getProvider('deepseek'),
+                'claude' => $this->getProvider('claude'),
+                'openai' => $this->getProvider('openai'),
                 default => null
             };
 
@@ -597,6 +617,16 @@ class HealthMetricsExtractionService
 
         } catch (\Exception $e) {
             throw new ExtractionException("Extraction failed: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Validate input text
+     */
+    protected function validateInput(string $rawText): void
+    {
+        if (empty(trim($rawText))) {
+            throw new ExtractionException("Input text cannot be empty");
         }
     }
 }
