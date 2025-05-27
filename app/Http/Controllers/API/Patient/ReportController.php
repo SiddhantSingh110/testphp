@@ -9,6 +9,7 @@ use App\Models\HealthMetric;
 use App\Services\AISummaryService;
 use App\Services\OCRService;
 use App\Services\ImageProcessingService;
+use App\Services\HealthMetricsExtraction\HealthMetricsExtractionService; // ✨ Add this
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
@@ -20,11 +21,16 @@ class ReportController extends Controller
 {
     protected $ocrService;
     protected $imageProcessingService;
+    protected $healthMetricsService; // ✨ Add this
 
-    public function __construct(OCRService $ocrService, ImageProcessingService $imageProcessingService)
-    {
+    public function __construct(
+        OCRService $ocrService, 
+        ImageProcessingService $imageProcessingService,
+        HealthMetricsExtractionService $healthMetricsService = null // ✨ Add this
+    ) {
         $this->ocrService = $ocrService;
         $this->imageProcessingService = $imageProcessingService;
+        $this->healthMetricsService = $healthMetricsService ?? app(HealthMetricsExtractionService::class); // ✨ Add this
         
         // Ensure storage directories exist
         ImageProcessingService::ensureDirectoriesExist();
@@ -145,7 +151,7 @@ class ReportController extends Controller
                 'ai_model_used' => 'gpt-4',
             ]);
 
-            // Step 5: ✨ NEW - Extract health metrics from AI summary instead of regex
+            // Step 5: ✨ ENHANCED - Extract health metrics using multi-provider system
             if (!empty($aiSummaryJson) && isset($aiSummaryJson['key_findings'])) {
                 $extractedMetrics = $this->extractMetricsFromAISummary($aiSummaryJson, $patientId, $report);
                 $createdMetrics = $extractedMetrics['metrics'];
@@ -228,53 +234,122 @@ class ReportController extends Controller
     }
 
     /**
-     * ✨ NEW METHOD: Extract health metrics from AI summary instead of regex
-     * This replaces the broken extractHealthMetricsAdvanced() method
+     * ✨ ENHANCED: Extract health metrics using multi-provider system
+     * This replaces the old extractMetricsFromAISummary method
      */
     private function extractMetricsFromAISummary($aiSummaryJson, $patientId, $report)
     {
+        try {
+            Log::info('🚀 Starting enhanced health metrics extraction', [
+                'report_id' => $report->id,
+                'patient_id' => $patientId,
+                'has_ai_summary' => !empty($aiSummaryJson),
+                'extraction_service' => 'multi-provider'
+            ]);
+
+            // Use the multi-provider extraction service
+            $extractionResult = $this->healthMetricsService->extractMetrics(
+                $report->aiSummary->raw_text ?? '', 
+                $aiSummaryJson, 
+                $patientId, 
+                $report
+            );
+
+            if ($extractionResult['success']) {
+                Log::info('✅ Enhanced health metrics extraction successful', [
+                    'report_id' => $report->id,
+                    'provider_used' => $extractionResult['provider_used'],
+                    'model_used' => $extractionResult['model_used'],
+                    'metrics_extracted' => count($extractionResult['metrics']),
+                    'categories_found' => $extractionResult['categories_found'],
+                    'duration_ms' => $extractionResult['duration_ms'],
+                    'attempts_made' => $extractionResult['attempts_made']
+                ]);
+
+                return [
+                    'metrics' => $extractionResult['metrics'],
+                    'categories_found' => $extractionResult['categories_found'],
+                    'extraction_metadata' => [
+                        'provider_used' => $extractionResult['provider_used'],
+                        'model_used' => $extractionResult['model_used'],
+                        'duration_ms' => $extractionResult['duration_ms'],
+                        'confidence_score' => $extractionResult['ai_response']['confidence_score'] ?? 'N/A',
+                        'extraction_version' => 'multi-provider-v1.0'
+                    ]
+                ];
+            } else {
+                Log::warning('⚠️ All providers failed for health metrics extraction', [
+                    'report_id' => $report->id,
+                    'attempts_made' => $extractionResult['attempts_made'],
+                    'duration_ms' => $extractionResult['duration_ms'],
+                    'error' => $extractionResult['error']
+                ]);
+
+                // Fallback to previous method if all providers fail
+                return $this->fallbackToLegacyExtraction($aiSummaryJson, $patientId, $report);
+            }
+
+        } catch (\Exception $e) {
+            Log::error('❌ Enhanced health metrics extraction failed completely', [
+                'report_id' => $report->id,
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+
+            // Fallback to previous method
+            return $this->fallbackToLegacyExtraction($aiSummaryJson, $patientId, $report);
+        }
+    }
+
+    /**
+     * ✨ Fallback to the original extraction logic if multi-provider fails
+     */
+    private function fallbackToLegacyExtraction($aiSummaryJson, $patientId, $report)
+    {
+        Log::info('🔄 Falling back to legacy extraction method', [
+            'report_id' => $report->id,
+            'reason' => 'multi-provider-system-failed'
+        ]);
+
+        // Use your existing extraction logic as fallback
         $extractedMetrics = [];
         $categoriesFound = [];
 
         if (!isset($aiSummaryJson['key_findings']) || !is_array($aiSummaryJson['key_findings'])) {
-            Log::warning('No key_findings in AI summary', ['report_id' => $report->id]);
+            Log::warning('No key_findings in AI summary for fallback', ['report_id' => $report->id]);
             return ['metrics' => [], 'categories_found' => []];
         }
 
         foreach ($aiSummaryJson['key_findings'] as $finding) {
             try {
-                // Handle both string and array findings
+                // Use your existing parsing logic
                 if (is_string($finding)) {
                     $parsedMetric = $this->parseStringFinding($finding);
                 } else if (is_array($finding)) {
                     $parsedMetric = $this->parseArrayFinding($finding);
                 } else {
-                    continue; // Skip invalid findings
+                    continue;
                 }
 
                 if (!$parsedMetric) {
-                    continue; // Skip if parsing failed
+                    continue;
                 }
 
-                // Map to standardized metric type
+                // Use your existing mapping logic
                 $standardizedType = $this->mapToStandardMetricType($parsedMetric['raw_name']);
                 
                 if (!$standardizedType) {
-                    Log::info('Could not map metric to standard type', [
-                        'raw_name' => $parsedMetric['raw_name'],
-                        'report_id' => $report->id
-                    ]);
-                    continue; // Skip unmappable metrics
+                    continue;
                 }
 
-                // Create health metric record
+                // Create health metric record using existing logic
                 $metric = HealthMetric::create([
                     'patient_id' => $patientId,
                     'type' => $standardizedType['type'],
                     'value' => $parsedMetric['value'],
                     'unit' => $parsedMetric['unit'] ?: $standardizedType['default_unit'],
                     'measured_at' => $report->report_date ?? now(),
-                    'notes' => "Auto-extracted from medical report (ID: {$report->id})",
+                    'notes' => "Auto-extracted from medical report (ID: {$report->id}) - Legacy fallback",
                     'source' => 'report',
                     'context' => 'medical_test',
                     'status' => $this->mapAIStatusToHealthStatus($parsedMetric['status']),
@@ -285,28 +360,30 @@ class ReportController extends Controller
                 $extractedMetrics[] = $metric;
                 $categoriesFound[] = $standardizedType['category'];
 
-                Log::info('Health metric created from AI finding', [
-                    'report_id' => $report->id,
-                    'raw_name' => $parsedMetric['raw_name'],
-                    'standardized_type' => $standardizedType['type'],
-                    'value' => $parsedMetric['value'],
-                    'unit' => $parsedMetric['unit'],
-                    'category' => $standardizedType['category']
-                ]);
-
             } catch (\Exception $e) {
-                Log::error('Failed to process AI finding', [
+                Log::error('Failed to process finding in legacy fallback', [
                     'finding' => $finding,
                     'error' => $e->getMessage(),
                     'report_id' => $report->id
                 ]);
-                continue; // Skip this finding but continue with others
+                continue;
             }
         }
 
+        Log::info('✅ Legacy fallback extraction completed', [
+            'report_id' => $report->id,
+            'metrics_extracted' => count($extractedMetrics),
+            'categories_found' => array_unique($categoriesFound)
+        ]);
+
         return [
             'metrics' => $extractedMetrics,
-            'categories_found' => array_unique($categoriesFound)
+            'categories_found' => array_unique($categoriesFound),
+            'extraction_metadata' => [
+                'provider_used' => 'legacy-fallback',
+                'model_used' => 'regex-parsing',
+                'extraction_version' => 'legacy-v1.0'
+            ]
         ];
     }
 

@@ -82,6 +82,33 @@ Route::middleware('auth:sanctum')->prefix('patient')->group(function () {
     Route::get('/reports/{id}/ocr-status', [ReportController::class, 'getOCRStatus']);
 });
 
+// 🔧 Admin Routes for Health Metrics Provider Management
+Route::middleware(['auth:sanctum'])->prefix('admin/health-metrics')->group(function () {
+    // Get current configuration and service health
+    Route::get('/configuration', [App\Http\Controllers\Admin\HealthMetricsAdminController::class, 'getConfiguration']);
+    
+    // Switch primary provider (DeepSeek ↔ Claude ↔ OpenAI)
+    Route::post('/provider', [App\Http\Controllers\Admin\HealthMetricsAdminController::class, 'switchPrimaryProvider']);
+    
+    // Update specific provider configuration
+    Route::put('/provider/{provider}', [App\Http\Controllers\Admin\HealthMetricsAdminController::class, 'updateProviderConfig'])
+        ->where('provider', 'deepseek|claude|openai');
+    
+    // Enable/disable specific provider
+    Route::patch('/provider/{provider}/toggle', [App\Http\Controllers\Admin\HealthMetricsAdminController::class, 'toggleProvider'])
+        ->where('provider', 'deepseek|claude|openai');
+    
+    // Test specific provider with sample data
+    Route::post('/provider/{provider}/test', [App\Http\Controllers\Admin\HealthMetricsAdminController::class, 'testProvider'])
+        ->where('provider', 'deepseek|claude|openai');
+    
+    // Get provider performance statistics
+    Route::get('/performance', [App\Http\Controllers\Admin\HealthMetricsAdminController::class, 'getProviderPerformance']);
+    
+    // Reset configuration to defaults (requires confirmation)
+    Route::post('/reset', [App\Http\Controllers\Admin\HealthMetricsAdminController::class, 'resetConfiguration']);
+});
+
 // 🆕 System utility routes for OCR
 Route::middleware('auth:sanctum')->prefix('system')->group(function () {
     // Check OCR service availability
@@ -114,4 +141,26 @@ Route::middleware('auth:sanctum')->prefix('system')->group(function () {
             'count' => $pendingReports->count()
         ]);
     });
+});
+
+// 📊 Public Health Metrics System Status (no auth required)
+Route::get('/system/health-metrics/status', function () {
+    try {
+        $extractionService = app(\App\Services\HealthMetricsExtraction\HealthMetricsExtractionService::class);
+        $serviceHealth = $extractionService->getServiceHealth();
+        
+        return response()->json([
+            'service_status' => $serviceHealth['service_status'],
+            'primary_provider' => $serviceHealth['primary_provider'],
+            'total_providers' => $serviceHealth['total_providers'],
+            'fallback_enabled' => $serviceHealth['fallback_enabled'],
+            'timestamp' => now()->toISOString()
+        ]);
+    } catch (\Exception $e) {
+        return response()->json([
+            'service_status' => 'error',
+            'error' => 'Service unavailable',
+            'timestamp' => now()->toISOString()
+        ], 500);
+    }
 });
