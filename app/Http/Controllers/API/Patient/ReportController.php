@@ -124,20 +124,7 @@ class ReportController extends Controller
                 }
             }
 
-            // Step 4: Extract health metrics if we have text
-            if (!empty($extractedText)) {
-                $extractedMetrics = $this->extractHealthMetricsAdvanced($extractedText);
-                if (!empty($extractedMetrics)) {
-                    $createdMetrics = HealthMetric::createFromAIExtraction(
-                        $patientId, 
-                        $extractedMetrics, 
-                        $report->report_date ?? now(),
-                        $report->id // Pass report ID for reference
-                    );
-                }
-            }
-
-            // Step 5: Generate AI summary with cleaned text
+            // Step 4: Generate AI summary with cleaned text
             $aiSummaryJson = null;
             $cleanedText = '';
             
@@ -148,7 +135,7 @@ class ReportController extends Controller
             }
 
             // Create AI summary record
-            AISummary::create([
+            $aiSummary = AISummary::create([
                 'report_id' => $report->id,
                 'raw_text' => $cleanedText, // Use cleaned text
                 'summary_json' => $aiSummaryJson ?? [],
@@ -157,6 +144,18 @@ class ReportController extends Controller
                     : 0,
                 'ai_model_used' => 'gpt-4',
             ]);
+
+            // Step 5: ✨ NEW - Extract health metrics from AI summary instead of regex
+            if (!empty($aiSummaryJson) && isset($aiSummaryJson['key_findings'])) {
+                $extractedMetrics = $this->extractMetricsFromAISummary($aiSummaryJson, $patientId, $report);
+                $createdMetrics = $extractedMetrics['metrics'];
+
+                Log::info('Health metrics extracted from AI summary', [
+                    'report_id' => $report->id,
+                    'metrics_count' => count($createdMetrics),
+                    'categories_found' => $extractedMetrics['categories_found']
+                ]);
+            }
 
             // Step 6: Clean up original file if OCR was successful
             if ($isImage && $report->isOCRComplete()) {
@@ -175,15 +174,8 @@ class ReportController extends Controller
                 'confidence_score' => $aiSummaryJson['confidence_score'] ?? null,
                 
                 // ✨ Enhanced health metrics information
-                'health_metrics' => [
-                    'total_extracted' => count($createdMetrics),
-                    'extraction_successful' => count($createdMetrics) > 0,
-                    'metrics_summary' => $this->formatExtractedMetricsSummary($createdMetrics),
-                    'categories_found' => $this->getMetricCategories($createdMetrics),
-                    'new_metrics_available' => count($createdMetrics) > 0 ? true : false,
-                ],
-                
-                // Individual metric details for frontend
+                'health_metrics' => $this->createDetailedMetricSummary($createdMetrics),
+           
                 'extracted_metrics_details' => collect($createdMetrics)->map(function($metric) {
                     return [
                         'id' => $metric->id,
@@ -198,10 +190,10 @@ class ReportController extends Controller
                         'source' => $metric->source,
                         'context' => $metric->context,
                         'reference_range' => $this->getReferenceRangeForMetric($metric->type),
-                        'is_new' => true, // Mark as new for review badge
+                        'is_recent' => true, // Mark as recent for review badge
                         'needs_review' => true, // Enable review badge
                     ];
-                })
+                })->toArray()
             ];
 
             // Add OCR specific information for images
@@ -233,6 +225,299 @@ class ReportController extends Controller
                 'message' => config('app.debug') ? $e->getMessage() : 'An error occurred during upload.'
             ], 500);
         }
+    }
+
+    /**
+     * ✨ NEW METHOD: Extract health metrics from AI summary instead of regex
+     * This replaces the broken extractHealthMetricsAdvanced() method
+     */
+    private function extractMetricsFromAISummary($aiSummaryJson, $patientId, $report)
+    {
+        $extractedMetrics = [];
+        $categoriesFound = [];
+
+        if (!isset($aiSummaryJson['key_findings']) || !is_array($aiSummaryJson['key_findings'])) {
+            Log::warning('No key_findings in AI summary', ['report_id' => $report->id]);
+            return ['metrics' => [], 'categories_found' => []];
+        }
+
+        foreach ($aiSummaryJson['key_findings'] as $finding) {
+            try {
+                // Handle both string and array findings
+                if (is_string($finding)) {
+                    $parsedMetric = $this->parseStringFinding($finding);
+                } else if (is_array($finding)) {
+                    $parsedMetric = $this->parseArrayFinding($finding);
+                } else {
+                    continue; // Skip invalid findings
+                }
+
+                if (!$parsedMetric) {
+                    continue; // Skip if parsing failed
+                }
+
+                // Map to standardized metric type
+                $standardizedType = $this->mapToStandardMetricType($parsedMetric['raw_name']);
+                
+                if (!$standardizedType) {
+                    Log::info('Could not map metric to standard type', [
+                        'raw_name' => $parsedMetric['raw_name'],
+                        'report_id' => $report->id
+                    ]);
+                    continue; // Skip unmappable metrics
+                }
+
+                // Create health metric record
+                $metric = HealthMetric::create([
+                    'patient_id' => $patientId,
+                    'type' => $standardizedType['type'],
+                    'value' => $parsedMetric['value'],
+                    'unit' => $parsedMetric['unit'] ?: $standardizedType['default_unit'],
+                    'measured_at' => $report->report_date ?? now(),
+                    'notes' => "Auto-extracted from medical report (ID: {$report->id})",
+                    'source' => 'report',
+                    'context' => 'medical_test',
+                    'status' => $this->mapAIStatusToHealthStatus($parsedMetric['status']),
+                    'category' => $standardizedType['category'],
+                    'subcategory' => $standardizedType['subcategory'],
+                ]);
+
+                $extractedMetrics[] = $metric;
+                $categoriesFound[] = $standardizedType['category'];
+
+                Log::info('Health metric created from AI finding', [
+                    'report_id' => $report->id,
+                    'raw_name' => $parsedMetric['raw_name'],
+                    'standardized_type' => $standardizedType['type'],
+                    'value' => $parsedMetric['value'],
+                    'unit' => $parsedMetric['unit'],
+                    'category' => $standardizedType['category']
+                ]);
+
+            } catch (\Exception $e) {
+                Log::error('Failed to process AI finding', [
+                    'finding' => $finding,
+                    'error' => $e->getMessage(),
+                    'report_id' => $report->id
+                ]);
+                continue; // Skip this finding but continue with others
+            }
+        }
+
+        return [
+            'metrics' => $extractedMetrics,
+            'categories_found' => array_unique($categoriesFound)
+        ];
+    }
+
+    /**
+     * Parse string-based finding (e.g., "Normal level of HDL cholesterol 48 mg/dL")
+     */
+    private function parseStringFinding($finding)
+    {
+        // Pattern 1: "Status level of Parameter Value Unit"
+        if (preg_match('/^(normal|elevated|high|low|decreased|increased|borderline|slightly)\s+level\s+of\s+(.+?)\s+([\d\.]+)\s*([a-zA-Z\/\%µ°]+)?/i', $finding, $matches)) {
+            return [
+                'raw_name' => trim($matches[2]),
+                'value' => $matches[3],
+                'unit' => $matches[4] ?? '',
+                'status' => strtolower($matches[1])
+            ];
+        }
+
+        // Pattern 2: "Parameter: Value Unit"
+        if (preg_match('/^(.+?):\s*([\d\.]+)\s*([a-zA-Z\/\%µ°]+)?/i', $finding, $matches)) {
+            return [
+                'raw_name' => trim($matches[1]),
+                'value' => $matches[2],
+                'unit' => $matches[3] ?? '',
+                'status' => 'unknown'
+            ];
+        }
+
+        // Pattern 3: "Parameter Value Unit (status)"
+        if (preg_match('/^(.+?)\s+([\d\.]+)\s*([a-zA-Z\/\%µ°]+)?\s*\((normal|high|low|elevated|decreased)\)/i', $finding, $matches)) {
+            return [
+                'raw_name' => trim($matches[1]),
+                'value' => $matches[2],
+                'unit' => $matches[3] ?? '',
+                'status' => strtolower($matches[4])
+            ];
+        }
+
+        return null; // Could not parse
+    }
+
+    /**
+     * Parse array-based finding from structured AI response
+     */
+    private function parseArrayFinding($finding)
+    {
+        if (!isset($finding['finding']) || !isset($finding['value'])) {
+            return null;
+        }
+
+        return [
+            'raw_name' => $finding['finding'],
+            'value' => $finding['value'],
+            'unit' => $finding['unit'] ?? '',
+            'status' => $finding['status'] ?? 'unknown'
+        ];
+    }
+
+    /**
+     * ✨ COMPREHENSIVE MEDICAL PARAMETER MAPPING
+     * Maps AI-extracted parameter names to standardized health metric types
+     */
+    private function mapToStandardMetricType($rawName)
+    {
+        $rawName = strtolower(trim($rawName));
+        
+        // Comprehensive mapping for all major medical parameters
+        $mappings = [
+            // Cholesterol Panel
+            'hdl cholesterol' => ['type' => 'hdl', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
+            'hdl' => ['type' => 'hdl', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
+            'ldl cholesterol' => ['type' => 'ldl', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
+            'ldl' => ['type' => 'ldl', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
+            'total cholesterol' => ['type' => 'total_cholesterol', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
+            'cholesterol' => ['type' => 'total_cholesterol', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
+            'triglycerides' => ['type' => 'triglycerides', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
+            'vldl cholesterol' => ['type' => 'vldl', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
+            'non hdl cholesterol' => ['type' => 'non_hdl_cholesterol', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
+
+            // Thyroid Panel
+            'tsh' => ['type' => 'tsh', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'mIU/L'],
+            'thyroid stimulating hormone' => ['type' => 'tsh', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'mIU/L'],
+            't3' => ['type' => 't3', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'ng/dL'],
+            'triiodothyronine' => ['type' => 't3', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'ng/dL'],
+            't4' => ['type' => 't4', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'μg/dL'],
+            'thyroxine' => ['type' => 't4', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'μg/dL'],
+            'free t3' => ['type' => 'free_t3', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'pg/mL'],
+            'free t4' => ['type' => 'free_t4', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'ng/dL'],
+
+            // Vitamins
+            'vitamin d' => ['type' => 'vitamin_d', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'ng/mL'],
+            '25-hydroxy vitamin d' => ['type' => 'vitamin_d', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'ng/mL'],
+            'vitamin d3' => ['type' => 'vitamin_d', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'ng/mL'],
+            'vitamin b12' => ['type' => 'vitamin_b12', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'pg/mL'],
+            'cobalamin' => ['type' => 'vitamin_b12', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'pg/mL'],
+            'folate' => ['type' => 'folate', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'ng/mL'],
+            'folic acid' => ['type' => 'folate', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'ng/mL'],
+            'vitamin b6' => ['type' => 'vitamin_b6', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'ng/mL'],
+
+            // Liver Function Tests
+            'alt' => ['type' => 'alt', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'U/L'],
+            'alanine aminotransferase' => ['type' => 'alt', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'U/L'],
+            'sgpt' => ['type' => 'alt', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'U/L'],
+            'ast' => ['type' => 'ast', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'U/L'],
+            'aspartate aminotransferase' => ['type' => 'ast', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'U/L'],
+            'sgot' => ['type' => 'ast', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'U/L'],
+            'alp' => ['type' => 'alp', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'U/L'],
+            'alkaline phosphatase' => ['type' => 'alp', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'U/L'],
+            'bilirubin' => ['type' => 'bilirubin', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'mg/dL'],
+            'total bilirubin' => ['type' => 'bilirubin', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'mg/dL'],
+
+            // Kidney Function Tests
+            'creatinine' => ['type' => 'creatinine', 'category' => 'organs', 'subcategory' => 'kidney', 'default_unit' => 'mg/dL'],
+            'serum creatinine' => ['type' => 'creatinine', 'category' => 'organs', 'subcategory' => 'kidney', 'default_unit' => 'mg/dL'],
+            'bun' => ['type' => 'blood_urea_nitrogen', 'category' => 'organs', 'subcategory' => 'kidney', 'default_unit' => 'mg/dL'],
+            'blood urea nitrogen' => ['type' => 'blood_urea_nitrogen', 'category' => 'organs', 'subcategory' => 'kidney', 'default_unit' => 'mg/dL'],
+            'uric acid' => ['type' => 'uric_acid', 'category' => 'organs', 'subcategory' => 'kidney', 'default_unit' => 'mg/dL'],
+            'egfr' => ['type' => 'egfr', 'category' => 'organs', 'subcategory' => 'kidney', 'default_unit' => 'mL/min/1.73m²'],
+
+            // Blood Count (Complete Blood Count)
+            'hemoglobin' => ['type' => 'hemoglobin', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'g/dL'],
+            'hb' => ['type' => 'hemoglobin', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'g/dL'],
+            'hematocrit' => ['type' => 'hematocrit', 'category' => 'blood', 'subcategory' => null, 'default_unit' => '%'],
+            'hct' => ['type' => 'hematocrit', 'category' => 'blood', 'subcategory' => null, 'default_unit' => '%'],
+            'rbc count' => ['type' => 'rbc_count', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'million/µL'],
+            'red blood cell count' => ['type' => 'rbc_count', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'million/µL'],
+            'wbc count' => ['type' => 'wbc_count', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'thousand/µL'],
+            'white blood cell count' => ['type' => 'wbc_count', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'thousand/µL'],
+            'platelet count' => ['type' => 'platelet_count', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'thousand/µL'],
+            'platelets' => ['type' => 'platelet_count', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'thousand/µL'],
+
+            // Diabetes/Glucose
+            'glucose' => ['type' => 'glucose_fasting', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'mg/dL'],
+            'fasting glucose' => ['type' => 'glucose_fasting', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'mg/dL'],
+            'blood sugar' => ['type' => 'glucose_fasting', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'mg/dL'],
+            'hba1c' => ['type' => 'hba1c', 'category' => 'blood', 'subcategory' => null, 'default_unit' => '%'],
+            'glycated hemoglobin' => ['type' => 'hba1c', 'category' => 'blood', 'subcategory' => null, 'default_unit' => '%'],
+
+            // Iron Studies
+            'iron' => ['type' => 'iron', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'μg/dL'],
+            'serum iron' => ['type' => 'iron', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'μg/dL'],
+            'ferritin' => ['type' => 'ferritin', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'ng/mL'],
+            'tibc' => ['type' => 'tibc', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'μg/dL'],
+
+            // Cardiac Markers
+            'troponin' => ['type' => 'troponin', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'ng/mL'],
+            'ck-mb' => ['type' => 'ck_mb', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'ng/mL'],
+            'bnp' => ['type' => 'bnp', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'pg/mL'],
+
+            // Electrolytes
+            'sodium' => ['type' => 'sodium', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'mEq/L'],
+            'potassium' => ['type' => 'potassium', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'mEq/L'],
+            'chloride' => ['type' => 'chloride', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'mEq/L'],
+
+            // Hormones
+            'testosterone' => ['type' => 'testosterone', 'category' => 'organs', 'subcategory' => 'endocrine', 'default_unit' => 'ng/dL'],
+            'estrogen' => ['type' => 'estrogen', 'category' => 'organs', 'subcategory' => 'endocrine', 'default_unit' => 'pg/mL'],
+            'cortisol' => ['type' => 'cortisol', 'category' => 'organs', 'subcategory' => 'endocrine', 'default_unit' => 'μg/dL'],
+            'insulin' => ['type' => 'insulin', 'category' => 'organs', 'subcategory' => 'endocrine', 'default_unit' => 'μIU/mL'],
+        ];
+
+        // Direct match
+        if (isset($mappings[$rawName])) {
+            return $mappings[$rawName];
+        }
+
+        // Fuzzy matching for variations
+        foreach ($mappings as $key => $mapping) {
+            if (strpos($rawName, $key) !== false || strpos($key, $rawName) !== false) {
+                return $mapping;
+            }
+        }
+
+        // Check for common variations
+        $variations = [
+            'cholesterol' => 'total_cholesterol',
+            'sugar' => 'glucose_fasting',
+            'haemoglobin' => 'hemoglobin',
+            'vit d' => 'vitamin_d',
+            'vit b12' => 'vitamin_b12',
+        ];
+
+        foreach ($variations as $variation => $standard) {
+            if (strpos($rawName, $variation) !== false && isset($mappings[$standard])) {
+                return $mappings[$standard];
+            }
+        }
+
+        return null; // No mapping found
+    }
+
+    /**
+     * Map AI status to health metric status
+     */
+    private function mapAIStatusToHealthStatus($aiStatus)
+    {
+        $statusMap = [
+            'normal' => 'normal',
+            'elevated' => 'high',
+            'high' => 'high',
+            'low' => 'high', // Both high and low are concerning
+            'decreased' => 'high',
+            'increased' => 'high',
+            'borderline' => 'borderline',
+            'slightly' => 'borderline',
+            'mild' => 'borderline',
+            'unknown' => 'normal'
+        ];
+
+        $aiStatus = strtolower($aiStatus);
+        return $statusMap[$aiStatus] ?? 'normal';
     }
 
     /**
@@ -279,20 +564,45 @@ class ReportController extends Controller
             'ldl' => 'LDL Cholesterol',
             'total_cholesterol' => 'Total Cholesterol',
             'triglycerides' => 'Triglycerides',
+            'vldl' => 'VLDL Cholesterol',
+            'non_hdl_cholesterol' => 'Non-HDL Cholesterol',
             'vitamin_d' => 'Vitamin D',
             'vitamin_b12' => 'Vitamin B12',
+            'vitamin_b6' => 'Vitamin B6',
             'folate' => 'Folate',
             'iron' => 'Iron',
             'ferritin' => 'Ferritin',
+            'tibc' => 'TIBC',
             'hemoglobin' => 'Hemoglobin',
             'hematocrit' => 'Hematocrit',
+            'rbc_count' => 'RBC Count',
+            'wbc_count' => 'WBC Count',
+            'platelet_count' => 'Platelet Count',
             'glucose_fasting' => 'Fasting Glucose',
             'hba1c' => 'HbA1c',
             'creatinine' => 'Creatinine',
             'blood_urea_nitrogen' => 'Blood Urea Nitrogen',
+            'uric_acid' => 'Uric Acid',
+            'egfr' => 'eGFR',
             'alt' => 'ALT',
             'ast' => 'AST',
+            'alp' => 'ALP',
+            'bilirubin' => 'Bilirubin',
             'tsh' => 'TSH',
+            't3' => 'T3',
+            't4' => 'T4',
+            'free_t3' => 'Free T3',
+            'free_t4' => 'Free T4',
+            'troponin' => 'Troponin',
+            'ck_mb' => 'CK-MB',
+            'bnp' => 'BNP',
+            'sodium' => 'Sodium',
+            'potassium' => 'Potassium',
+            'chloride' => 'Chloride',
+            'testosterone' => 'Testosterone',
+            'estrogen' => 'Estrogen',
+            'cortisol' => 'Cortisol',
+            'insulin' => 'Insulin',
             'blood_pressure' => 'Blood Pressure'
         ];
 
@@ -315,6 +625,43 @@ class ReportController extends Controller
             'max' => $ranges['max'] ?? null,
             'unit' => $ranges['unit'] ?? '',
             'display' => $this->formatReferenceRangeDisplay($ranges)
+        ];
+    }
+    
+    /**
+     * Enhanced: Create detailed metric summary for UI
+     */
+    private function createDetailedMetricSummary($createdMetrics)
+    {
+        if (empty($createdMetrics)) {
+            return [
+                'total_extracted' => 0,
+                'extraction_successful' => false,
+                'metrics_summary' => 'No health metrics found in this report.',
+                'categories_found' => [],
+                'new_metrics_available' => false,
+            ];
+        }
+
+        $count = count($createdMetrics);
+        $categories = collect($createdMetrics)->groupBy('category')->keys()->filter()->values();
+        
+        // Enhanced summary message
+        if ($categories->count() > 1) {
+            $summary = "Successfully extracted {$count} health metrics across " . $categories->count() . " categories: " . $categories->join(', ');
+        } else if ($categories->count() === 1) {
+            $summary = "Found {$count} health metrics from {$categories->first()} category";
+        } else {
+            $summary = "Extracted {$count} health metrics from your medical report";
+        }
+
+        return [
+            'total_extracted' => $count,
+            'extraction_successful' => true,
+            'metrics_summary' => $summary,
+            'categories_found' => $categories->toArray(),
+            'new_metrics_available' => true,
+            'needs_review_count' => $count, // All new metrics need review initially
         ];
     }
 
@@ -426,78 +773,6 @@ class ReportController extends Controller
     }
 
     /**
-     * Enhanced health metrics extraction
-     */
-    private function extractHealthMetricsAdvanced($text)
-    {
-        $extractedMetrics = [];
-        
-        // Pattern 1: Standard format - "Parameter Name: Value Unit"
-        preg_match_all('/([A-Za-z\s\(\)\/\-\.]+):\s*([\d\.]+)\s*([a-zA-Z\/\%µ°]+)?/i', $text, $matches1, PREG_SET_ORDER);
-        
-        // Pattern 2: Table format - "Parameter Name Value Unit Range"
-        preg_match_all('/([A-Z][A-Za-z\s\(\)\/\-\.]{3,})\s+([\d\.]+)\s+([a-zA-Z\/\%µ°]+)\s+([\d\.\-\s\<\>]+)/i', $text, $matches2, PREG_SET_ORDER);
-        
-        // Pattern 3: Lab format - "Parameter (Unit): Value"
-        preg_match_all('/([A-Za-z\s\(\)\/\-\.]+)\s*\(([a-zA-Z\/\%µ°]+)\):\s*([\d\.]+)/i', $text, $matches3, PREG_SET_ORDER);
-        
-        // Process matches
-        foreach ($matches1 as $match) {
-            $parameter = trim($match[1]);
-            $value = $match[2];
-            $unit = isset($match[3]) ? trim($match[3]) : '';
-            
-            if ($this->isValidHealthParameter($parameter, $value)) {
-                $extractedMetrics[] = [
-                    'parameter' => $parameter,
-                    'value' => $value,
-                    'unit' => $unit,
-                    'pattern' => 'standard'
-                ];
-            }
-        }
-        
-        // Remove duplicates
-        $uniqueMetrics = [];
-        foreach ($extractedMetrics as $metric) {
-            $key = strtolower(preg_replace('/[^a-zA-Z0-9]/', '', $metric['parameter']));
-            if (!isset($uniqueMetrics[$key])) {
-                $uniqueMetrics[$key] = $metric;
-            }
-        }
-        
-        return array_values($uniqueMetrics);
-    }
-
-    /**
-     * Validate health parameter
-     */
-    private function isValidHealthParameter($parameter, $value)
-    {
-        if (strlen(trim($parameter)) < 3 || strlen(trim($parameter)) > 50) {
-            return false;
-        }
-        
-        if (!is_numeric($value)) {
-            return false;
-        }
-        
-        $skipList = [
-            'page', 'date', 'time', 'phone', 'age', 'year', 'report', 'id', 'number',
-            'address', 'name', 'total', 'amount', 'cost', 'price', 'fee'
-        ];
-        
-        $paramLower = strtolower($parameter);
-        foreach ($skipList as $skip) {
-            if (strpos($paramLower, $skip) !== false) {
-                return false;
-            }
-        }
-        
-        return true;
-    }
-
-    /**
      * Retry OCR processing for failed reports
      */
     public function retryOCR(Request $request, $id)
@@ -584,6 +859,9 @@ class ReportController extends Controller
         ]);
     }
 
+    /**
+     * Get all reports for the authenticated patient
+     */
     public function index()
     {
         $patientId = auth()->id();
@@ -612,6 +890,9 @@ class ReportController extends Controller
         ]);
     }
 
+    /**
+     * Get detailed view of a specific report
+     */
     public function show($id)
     {
         $patientId = auth()->id();
@@ -638,6 +919,9 @@ class ReportController extends Controller
         ]);
     }
 
+    /**
+     * Delete a specific report
+     */
     public function destroy($id)
     {
         $patientId = auth()->id();
@@ -727,6 +1011,9 @@ class ReportController extends Controller
         }
     }
 
+    /**
+     * Download AI summary as PDF
+     */
     public function downloadSummaryPdf($id)
     {
         $report = PatientReport::with('aiSummary')

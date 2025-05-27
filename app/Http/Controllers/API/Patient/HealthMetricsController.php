@@ -153,7 +153,7 @@ class HealthMetricsController extends Controller
         
         $groupedBySource = $recentMetrics->groupBy('source');
         
-        // Format for timeline display
+        // Enhanced timeline formatting
         $timeline = [];
         foreach ($groupedByDate as $date => $metrics) {
             $reportMetrics = $metrics->where('source', 'report');
@@ -176,6 +176,7 @@ class HealthMetricsController extends Controller
                     })->values(),
                     'icon' => 'document-text',
                     'color' => '#38BFA7',
+                    'created_at' => $reportMetrics->first()->created_at->toISOString(),
                 ];
             }
             
@@ -196,9 +197,15 @@ class HealthMetricsController extends Controller
                     })->values(),
                     'icon' => 'create',
                     'color' => '#2C7BE5',
+                    'created_at' => $manualMetrics->first()->created_at->toISOString(),
                 ];
             }
         }
+        
+        // Sort timeline by creation time (newest first)
+        usort($timeline, function($a, $b) {
+            return strtotime($b['created_at']) - strtotime($a['created_at']);
+        });
         
         return response()->json([
             'timeline' => $timeline,
@@ -207,6 +214,7 @@ class HealthMetricsController extends Controller
                 'from_reports' => $groupedBySource->get('report', collect())->count(),
                 'manual_entries' => $groupedBySource->get('manual', collect())->count(),
                 'days_covered' => $days,
+                'latest_extraction' => $groupedBySource->get('report', collect())->first()?->created_at?->toISOString(),
             ],
         ]);
     }
