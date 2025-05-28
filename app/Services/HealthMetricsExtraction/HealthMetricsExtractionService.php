@@ -6,7 +6,7 @@ use App\Services\HealthMetricsExtraction\Configuration\ProviderConfigManager;
 use App\Services\HealthMetricsExtraction\Providers\DeepseekExtractionProvider;
 use App\Services\HealthMetricsExtraction\Providers\ClaudeExtractionProvider;
 use App\Services\HealthMetricsExtraction\Providers\OpenAIExtractionProvider;
-use App\Services\HealthMetricsExtraction\Configuration\ProviderConfig;
+use App\Services\HealthMetricsExtraction\MetricMapping\StandardMetricMapper; // ✨ NEW
 use App\Services\HealthMetricsExtraction\Exceptions\ExtractionException;
 use App\Services\HealthMetricsExtraction\Exceptions\ProviderException;
 use App\Services\HealthMetricsExtraction\Exceptions\ConfigurationException;
@@ -18,12 +18,16 @@ use Illuminate\Support\Facades\Cache;
 class HealthMetricsExtractionService
 {
     protected ProviderConfigManager $configManager;
+    protected StandardMetricMapper $metricMapper; // ✨ NEW: StandardMetricMapper dependency
     protected array $providers = [];
     protected array $providerPerformance = [];
 
-    public function __construct(ProviderConfigManager $configManager = null)
-    {
+    public function __construct(
+        ProviderConfigManager $configManager = null,
+        StandardMetricMapper $metricMapper = null // ✨ NEW: Inject StandardMetricMapper
+    ) {
         $this->configManager = $configManager ?? new ProviderConfigManager();
+        $this->metricMapper = $metricMapper ?? new StandardMetricMapper(); // ✨ NEW
         $this->initializeProviders();
     }
 
@@ -51,7 +55,8 @@ class HealthMetricsExtractionService
             'primary_provider' => $primaryProvider,
             'secondary_provider' => $secondaryProvider,
             'fallback_enabled' => $this->configManager->isFallbackEnabled(),
-            'configuration_source' => 'ENV File'
+            'configuration_source' => 'ENV File',
+            'mapper_statistics' => $this->metricMapper->getMappingStatistics() // ✨ NEW: Include mapper stats
         ]);
 
         $providersToTry = $this->getProvidersToTry();
@@ -69,6 +74,13 @@ class HealthMetricsExtractionService
                     continue;
                 }
 
+                // ✨ ADD THIS LOG HERE
+                Log::info("🤖 === PROCESSING WITH " . strtoupper($providerName) . " ===", [
+                    'provider' => $providerName,
+                    'model' => $provider->getModel(),
+                    'report_id' => $report->id
+                ]);
+
                 $providerStartTime = microtime(true);
                 
                 // Attempt extraction with this provider
@@ -76,7 +88,16 @@ class HealthMetricsExtractionService
                 
                 $providerDuration = round((microtime(true) - $providerStartTime) * 1000, 2);
                 
-                // Process extracted metrics
+                // ✨ ADD THIS LOG HERE
+                Log::info("📤 {$providerName} RAW OUTPUT:", [
+                    'provider' => $providerName,
+                    'duration_ms' => $providerDuration,
+                    'confidence_score' => $aiResponse['confidence_score'] ?? 'N/A',
+                    'key_findings_count' => isset($aiResponse['key_findings']) ? count($aiResponse['key_findings']) : 0,
+                    'full_response' => $aiResponse
+                ]);
+
+                // ✨ UPDATED: Process extracted metrics using StandardMetricMapper
                 $extractedMetrics = $this->processAIResponse($aiResponse, $patientId, $report);
                 
                 // Record successful extraction
@@ -84,6 +105,33 @@ class HealthMetricsExtractionService
                 
                 $totalDuration = round((microtime(true) - $startTime) * 1000, 2);
                 
+                // ✨ ADD THIS LOG HERE
+                Log::info("✅ === {$providerName} PROCESSING SUCCESSFUL ===", [
+                    'provider' => $providerName,
+                    'metrics_extracted' => count($extractedMetrics['metrics']),
+                    'categories_found' => $extractedMetrics['categories_found'],
+                    'quality_score' => isset($aiResponse['key_findings']) && count($aiResponse['key_findings']) > 0 
+                        ? round((count($extractedMetrics['metrics']) / count($aiResponse['key_findings'])) * 100, 1) . '%'
+                        : 'N/A'
+                ]);
+
+                // ✨ ADD DETAILED METRICS LOG HERE
+                if (!empty($extractedMetrics['metrics'])) {
+                    $metricSummary = [];
+                    foreach ($extractedMetrics['metrics'] as $metric) {
+                        $metricSummary[] = [
+                            'type' => $metric->type,
+                            'value' => $metric->value,
+                            'unit' => $metric->unit,
+                            'status' => $metric->status
+                        ];
+                    }
+                    
+                    Log::info("📊 {$providerName} EXTRACTED METRICS:", [
+                        'provider' => $providerName,
+                        'metrics' => $metricSummary
+                    ]);
+                }
                 Log::info("ENV-based health metrics extraction successful", [
                     'report_id' => $report->id,
                     'provider_used' => $providerName,
@@ -198,7 +246,7 @@ class HealthMetricsExtractionService
     }
 
     /**
-     * Process AI response and create health metrics
+     * ✨ UPDATED: Process AI response and create health metrics using StandardMetricMapper
      */
     protected function processAIResponse(array $aiResponse, int $patientId, PatientReport $report): array
     {
@@ -218,9 +266,19 @@ class HealthMetricsExtractionService
                     continue;
                 }
 
-                // Map to standardized metric type
-                $standardizedType = $this->mapToStandardMetricType($parsedMetric['raw_name']);
-                if (!$standardizedType) {
+                // ✨ NEW: Use StandardMetricMapper instead of duplicate logic
+                $mappingContext = [
+                    'value' => $parsedMetric['value'],
+                    'unit' => $parsedMetric['unit'],
+                    'status' => $parsedMetric['status']
+                ];
+                
+                $standardizedMapping = $this->metricMapper->mapToStandardType(
+                    $parsedMetric['raw_name'], 
+                    $mappingContext
+                );
+                
+                if (!$standardizedMapping) {
                     Log::info('Could not map metric to standard type', [
                         'raw_name' => $parsedMetric['raw_name'],
                         'report_id' => $report->id
@@ -231,27 +289,28 @@ class HealthMetricsExtractionService
                 // Create health metric record
                 $metric = HealthMetric::create([
                     'patient_id' => $patientId,
-                    'type' => $standardizedType['type'],
+                    'type' => $standardizedMapping['type'],
                     'value' => $parsedMetric['value'],
-                    'unit' => $parsedMetric['unit'] ?: $standardizedType['default_unit'],
+                    'unit' => $parsedMetric['unit'] ?: $standardizedMapping['default_unit'],
                     'measured_at' => $report->report_date ?? now(),
-                    'notes' => "Auto-extracted from medical report (ID: {$report->id})",
+                    'notes' => "Auto-extracted from medical report (ID: {$report->id}) via StandardMetricMapper",
                     'source' => 'report',
                     'context' => 'medical_test',
                     'status' => $this->mapAIStatusToHealthStatus($parsedMetric['status']),
-                    'category' => $standardizedType['category'],
-                    'subcategory' => $standardizedType['subcategory'],
+                    'category' => $standardizedMapping['category'],
+                    'subcategory' => $standardizedMapping['subcategory'],
                 ]);
 
                 $extractedMetrics[] = $metric;
-                $categoriesFound[] = $standardizedType['category'];
+                $categoriesFound[] = $standardizedMapping['category'];
 
-                Log::debug('Health metric created from AI finding', [
+                Log::debug('Health metric created from AI finding via StandardMetricMapper', [
                     'report_id' => $report->id,
                     'raw_name' => $parsedMetric['raw_name'],
-                    'standardized_type' => $standardizedType['type'],
+                    'standardized_type' => $standardizedMapping['type'],
                     'value' => $parsedMetric['value'],
-                    'category' => $standardizedType['category']
+                    'category' => $standardizedMapping['category'],
+                    'mapping_confidence' => $standardizedMapping['mapping_confidence'] ?? null
                 ]);
 
             } catch (\Exception $e) {
@@ -339,67 +398,7 @@ class HealthMetricsExtractionService
         ];
     }
 
-    /**
-     * Map raw parameter name to standardized health metric type
-     * This uses the same comprehensive mapping from your ReportController
-     */
-    protected function mapToStandardMetricType(string $rawName): ?array
-    {
-        $rawName = strtolower(trim($rawName));
-        
-        // Use the same comprehensive mapping from your existing ReportController
-        $mappings = [
-            // Cholesterol Panel
-            'hdl cholesterol' => ['type' => 'hdl', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
-            'hdl' => ['type' => 'hdl', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
-            'ldl cholesterol' => ['type' => 'ldl', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
-            'ldl' => ['type' => 'ldl', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
-            'total cholesterol' => ['type' => 'total_cholesterol', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
-            'cholesterol' => ['type' => 'total_cholesterol', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
-            'triglycerides' => ['type' => 'triglycerides', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
-
-            // Thyroid Panel
-            'tsh' => ['type' => 'tsh', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'mIU/L'],
-            'thyroid stimulating hormone' => ['type' => 'tsh', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'mIU/L'],
-            't3' => ['type' => 't3', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'ng/dL'],
-            't4' => ['type' => 't4', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'μg/dL'],
-
-            // Vitamins
-            'vitamin d' => ['type' => 'vitamin_d', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'ng/mL'],
-            'vitamin b12' => ['type' => 'vitamin_b12', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'pg/mL'],
-            'folate' => ['type' => 'folate', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'ng/mL'],
-
-            // Liver Function
-            'alt' => ['type' => 'alt', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'U/L'],
-            'ast' => ['type' => 'ast', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'U/L'],
-            'bilirubin' => ['type' => 'bilirubin', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'mg/dL'],
-
-            // Kidney Function
-            'creatinine' => ['type' => 'creatinine', 'category' => 'organs', 'subcategory' => 'kidney', 'default_unit' => 'mg/dL'],
-            'blood urea nitrogen' => ['type' => 'blood_urea_nitrogen', 'category' => 'organs', 'subcategory' => 'kidney', 'default_unit' => 'mg/dL'],
-            'uric acid' => ['type' => 'uric_acid', 'category' => 'organs', 'subcategory' => 'kidney', 'default_unit' => 'mg/dL'],
-
-            // Blood Count
-            'hemoglobin' => ['type' => 'hemoglobin', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'g/dL'],
-            'hematocrit' => ['type' => 'hematocrit', 'category' => 'blood', 'subcategory' => null, 'default_unit' => '%'],
-            'glucose' => ['type' => 'glucose_fasting', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'mg/dL'],
-            'blood sugar' => ['type' => 'glucose_fasting', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'mg/dL'],
-        ];
-
-        // Direct match
-        if (isset($mappings[$rawName])) {
-            return $mappings[$rawName];
-        }
-
-        // Fuzzy matching
-        foreach ($mappings as $key => $mapping) {
-            if (strpos($rawName, $key) !== false || strpos($key, $rawName) !== false) {
-                return $mapping;
-            }
-        }
-
-        return null;
-    }
+    // ✨ REMOVED: mapToStandardMetricType() method - now handled by StandardMetricMapper
 
     /**
      * Map AI status to health metric status
@@ -469,7 +468,8 @@ class HealthMetricsExtractionService
         Log::info("Initialized health metrics extraction providers", [
             'available_providers' => array_keys($this->providers),
             'primary_provider' => $this->configManager->getPrimaryProvider(),
-            'secondary_provider' => $this->configManager->getSecondaryProvider()
+            'secondary_provider' => $this->configManager->getSecondaryProvider(),
+            'mapper_statistics' => $this->metricMapper->getMappingStatistics() // ✨ NEW
         ]);
     }
 
@@ -589,8 +589,17 @@ class HealthMetricsExtractionService
             'fallback_enabled' => $this->configManager->isFallbackEnabled(),
             'providers' => $providers,
             'total_providers' => count($this->providers),
-            'configuration_summary' => $this->configManager->getConfigurationSummary()
+            'configuration_summary' => $this->configManager->getConfigurationSummary(),
+            'mapper_statistics' => $this->metricMapper->getMappingStatistics() // ✨ NEW
         ];
+    }
+
+    /**
+     * ✨ NEW: Get mapping statistics from StandardMetricMapper
+     */
+    public function getMappingStatistics(): array
+    {
+        return $this->metricMapper->getMappingStatistics();
     }
 
     /**

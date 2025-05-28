@@ -9,7 +9,7 @@ use App\Models\HealthMetric;
 use App\Services\AISummaryService;
 use App\Services\OCRService;
 use App\Services\ImageProcessingService;
-use App\Services\HealthMetricsExtraction\HealthMetricsExtractionService; // ✨ Add this
+use App\Services\HealthMetricsExtraction\HealthMetricsExtractionService; // ✨ Already added
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
@@ -21,16 +21,16 @@ class ReportController extends Controller
 {
     protected $ocrService;
     protected $imageProcessingService;
-    protected $healthMetricsService; // ✨ Add this
+    protected $healthMetricsService; // ✨ Already added
 
     public function __construct(
         OCRService $ocrService, 
         ImageProcessingService $imageProcessingService,
-        HealthMetricsExtractionService $healthMetricsService = null // ✨ Add this
+        HealthMetricsExtractionService $healthMetricsService = null // ✨ Already added
     ) {
         $this->ocrService = $ocrService;
         $this->imageProcessingService = $imageProcessingService;
-        $this->healthMetricsService = $healthMetricsService ?? app(HealthMetricsExtractionService::class); // ✨ Add this
+        $this->healthMetricsService = $healthMetricsService ?? app(HealthMetricsExtractionService::class); // ✨ Already added
         
         // Ensure storage directories exist
         ImageProcessingService::ensureDirectoriesExist();
@@ -151,7 +151,7 @@ class ReportController extends Controller
                 'ai_model_used' => 'gpt-4',
             ]);
 
-            // Step 5: ✨ ENHANCED - Extract health metrics using multi-provider system
+            // Step 5: ✨ UPDATED - Extract health metrics using multi-provider system
             if (!empty($aiSummaryJson) && isset($aiSummaryJson['key_findings'])) {
                 $extractedMetrics = $this->extractMetricsFromAISummary($aiSummaryJson, $patientId, $report);
                 $createdMetrics = $extractedMetrics['metrics'];
@@ -234,20 +234,20 @@ class ReportController extends Controller
     }
 
     /**
-     * ✨ ENHANCED: Extract health metrics using multi-provider system
-     * This replaces the old extractMetricsFromAISummary method
+     * ✨ SIMPLIFIED: Extract health metrics using HealthMetricsExtractionService
+     * This replaces the old extractMetricsFromAISummary method with cleaner orchestration
      */
     private function extractMetricsFromAISummary($aiSummaryJson, $patientId, $report)
     {
         try {
-            Log::info('🚀 Starting enhanced health metrics extraction', [
+            Log::info('🚀 Starting health metrics extraction via service', [
                 'report_id' => $report->id,
                 'patient_id' => $patientId,
                 'has_ai_summary' => !empty($aiSummaryJson),
-                'extraction_service' => 'multi-provider'
+                'extraction_method' => 'HealthMetricsExtractionService'
             ]);
 
-            // Use the multi-provider extraction service
+            // ✨ CLEAN: Single service call replaces 200+ lines of duplicate logic
             $extractionResult = $this->healthMetricsService->extractMetrics(
                 $report->aiSummary->raw_text ?? '', 
                 $aiSummaryJson, 
@@ -256,7 +256,7 @@ class ReportController extends Controller
             );
 
             if ($extractionResult['success']) {
-                Log::info('✅ Enhanced health metrics extraction successful', [
+                Log::info('✅ Health metrics extraction successful', [
                     'report_id' => $report->id,
                     'provider_used' => $extractionResult['provider_used'],
                     'model_used' => $extractionResult['model_used'],
@@ -274,7 +274,7 @@ class ReportController extends Controller
                         'model_used' => $extractionResult['model_used'],
                         'duration_ms' => $extractionResult['duration_ms'],
                         'confidence_score' => $extractionResult['ai_response']['confidence_score'] ?? 'N/A',
-                        'extraction_version' => 'multi-provider-v1.0'
+                        'extraction_version' => 'multi-provider-service-v2.0'
                     ]
                 ];
             } else {
@@ -285,338 +285,47 @@ class ReportController extends Controller
                     'error' => $extractionResult['error']
                 ]);
 
-                // Fallback to previous method if all providers fail
-                return $this->fallbackToLegacyExtraction($aiSummaryJson, $patientId, $report);
+                // ✨ NO FALLBACK: The service handles all provider fallbacks internally
+                return [
+                    'metrics' => [],
+                    'categories_found' => [],
+                    'extraction_metadata' => [
+                        'provider_used' => 'none',
+                        'model_used' => 'none',
+                        'duration_ms' => $extractionResult['duration_ms'],
+                        'error' => $extractionResult['error'],
+                        'extraction_version' => 'multi-provider-service-v2.0-failed'
+                    ]
+                ];
             }
 
         } catch (\Exception $e) {
-            Log::error('❌ Enhanced health metrics extraction failed completely', [
+            Log::error('❌ Health metrics extraction service failed completely', [
                 'report_id' => $report->id,
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString()
             ]);
 
-            // Fallback to previous method
-            return $this->fallbackToLegacyExtraction($aiSummaryJson, $patientId, $report);
-        }
-    }
-
-    /**
-     * ✨ Fallback to the original extraction logic if multi-provider fails
-     */
-    private function fallbackToLegacyExtraction($aiSummaryJson, $patientId, $report)
-    {
-        Log::info('🔄 Falling back to legacy extraction method', [
-            'report_id' => $report->id,
-            'reason' => 'multi-provider-system-failed'
-        ]);
-
-        // Use your existing extraction logic as fallback
-        $extractedMetrics = [];
-        $categoriesFound = [];
-
-        if (!isset($aiSummaryJson['key_findings']) || !is_array($aiSummaryJson['key_findings'])) {
-            Log::warning('No key_findings in AI summary for fallback', ['report_id' => $report->id]);
-            return ['metrics' => [], 'categories_found' => []];
-        }
-
-        foreach ($aiSummaryJson['key_findings'] as $finding) {
-            try {
-                // Use your existing parsing logic
-                if (is_string($finding)) {
-                    $parsedMetric = $this->parseStringFinding($finding);
-                } else if (is_array($finding)) {
-                    $parsedMetric = $this->parseArrayFinding($finding);
-                } else {
-                    continue;
-                }
-
-                if (!$parsedMetric) {
-                    continue;
-                }
-
-                // Use your existing mapping logic
-                $standardizedType = $this->mapToStandardMetricType($parsedMetric['raw_name']);
-                
-                if (!$standardizedType) {
-                    continue;
-                }
-
-                // Create health metric record using existing logic
-                $metric = HealthMetric::create([
-                    'patient_id' => $patientId,
-                    'type' => $standardizedType['type'],
-                    'value' => $parsedMetric['value'],
-                    'unit' => $parsedMetric['unit'] ?: $standardizedType['default_unit'],
-                    'measured_at' => $report->report_date ?? now(),
-                    'notes' => "Auto-extracted from medical report (ID: {$report->id}) - Legacy fallback",
-                    'source' => 'report',
-                    'context' => 'medical_test',
-                    'status' => $this->mapAIStatusToHealthStatus($parsedMetric['status']),
-                    'category' => $standardizedType['category'],
-                    'subcategory' => $standardizedType['subcategory'],
-                ]);
-
-                $extractedMetrics[] = $metric;
-                $categoriesFound[] = $standardizedType['category'];
-
-            } catch (\Exception $e) {
-                Log::error('Failed to process finding in legacy fallback', [
-                    'finding' => $finding,
+            // Return empty result on complete failure
+            return [
+                'metrics' => [],
+                'categories_found' => [],
+                'extraction_metadata' => [
+                    'provider_used' => 'error',
+                    'model_used' => 'error',
                     'error' => $e->getMessage(),
-                    'report_id' => $report->id
-                ]);
-                continue;
-            }
-        }
-
-        Log::info('✅ Legacy fallback extraction completed', [
-            'report_id' => $report->id,
-            'metrics_extracted' => count($extractedMetrics),
-            'categories_found' => array_unique($categoriesFound)
-        ]);
-
-        return [
-            'metrics' => $extractedMetrics,
-            'categories_found' => array_unique($categoriesFound),
-            'extraction_metadata' => [
-                'provider_used' => 'legacy-fallback',
-                'model_used' => 'regex-parsing',
-                'extraction_version' => 'legacy-v1.0'
-            ]
-        ];
-    }
-
-    /**
-     * Parse string-based finding (e.g., "Normal level of HDL cholesterol 48 mg/dL")
-     */
-    private function parseStringFinding($finding)
-    {
-        // Pattern 1: "Status level of Parameter Value Unit"
-        if (preg_match('/^(normal|elevated|high|low|decreased|increased|borderline|slightly)\s+level\s+of\s+(.+?)\s+([\d\.]+)\s*([a-zA-Z\/\%µ°]+)?/i', $finding, $matches)) {
-            return [
-                'raw_name' => trim($matches[2]),
-                'value' => $matches[3],
-                'unit' => $matches[4] ?? '',
-                'status' => strtolower($matches[1])
+                    'extraction_version' => 'multi-provider-service-v2.0-error'
+                ]
             ];
         }
-
-        // Pattern 2: "Parameter: Value Unit"
-        if (preg_match('/^(.+?):\s*([\d\.]+)\s*([a-zA-Z\/\%µ°]+)?/i', $finding, $matches)) {
-            return [
-                'raw_name' => trim($matches[1]),
-                'value' => $matches[2],
-                'unit' => $matches[3] ?? '',
-                'status' => 'unknown'
-            ];
-        }
-
-        // Pattern 3: "Parameter Value Unit (status)"
-        if (preg_match('/^(.+?)\s+([\d\.]+)\s*([a-zA-Z\/\%µ°]+)?\s*\((normal|high|low|elevated|decreased)\)/i', $finding, $matches)) {
-            return [
-                'raw_name' => trim($matches[1]),
-                'value' => $matches[2],
-                'unit' => $matches[3] ?? '',
-                'status' => strtolower($matches[4])
-            ];
-        }
-
-        return null; // Could not parse
     }
 
-    /**
-     * Parse array-based finding from structured AI response
-     */
-    private function parseArrayFinding($finding)
-    {
-        if (!isset($finding['finding']) || !isset($finding['value'])) {
-            return null;
-        }
-
-        return [
-            'raw_name' => $finding['finding'],
-            'value' => $finding['value'],
-            'unit' => $finding['unit'] ?? '',
-            'status' => $finding['status'] ?? 'unknown'
-        ];
-    }
-
-    /**
-     * ✨ COMPREHENSIVE MEDICAL PARAMETER MAPPING
-     * Maps AI-extracted parameter names to standardized health metric types
-     */
-    private function mapToStandardMetricType($rawName)
-    {
-        $rawName = strtolower(trim($rawName));
-        
-        // Comprehensive mapping for all major medical parameters
-        $mappings = [
-            // Cholesterol Panel
-            'hdl cholesterol' => ['type' => 'hdl', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
-            'hdl' => ['type' => 'hdl', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
-            'ldl cholesterol' => ['type' => 'ldl', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
-            'ldl' => ['type' => 'ldl', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
-            'total cholesterol' => ['type' => 'total_cholesterol', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
-            'cholesterol' => ['type' => 'total_cholesterol', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
-            'triglycerides' => ['type' => 'triglycerides', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
-            'vldl cholesterol' => ['type' => 'vldl', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
-            'non hdl cholesterol' => ['type' => 'non_hdl_cholesterol', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'mg/dL'],
-
-            // Thyroid Panel
-            'tsh' => ['type' => 'tsh', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'mIU/L'],
-            'thyroid stimulating hormone' => ['type' => 'tsh', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'mIU/L'],
-            't3' => ['type' => 't3', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'ng/dL'],
-            'triiodothyronine' => ['type' => 't3', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'ng/dL'],
-            't4' => ['type' => 't4', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'μg/dL'],
-            'thyroxine' => ['type' => 't4', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'μg/dL'],
-            'free t3' => ['type' => 'free_t3', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'pg/mL'],
-            'free t4' => ['type' => 'free_t4', 'category' => 'organs', 'subcategory' => 'thyroid', 'default_unit' => 'ng/dL'],
-
-            // Vitamins
-            'vitamin d' => ['type' => 'vitamin_d', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'ng/mL'],
-            '25-hydroxy vitamin d' => ['type' => 'vitamin_d', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'ng/mL'],
-            'vitamin d3' => ['type' => 'vitamin_d', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'ng/mL'],
-            'vitamin b12' => ['type' => 'vitamin_b12', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'pg/mL'],
-            'cobalamin' => ['type' => 'vitamin_b12', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'pg/mL'],
-            'folate' => ['type' => 'folate', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'ng/mL'],
-            'folic acid' => ['type' => 'folate', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'ng/mL'],
-            'vitamin b6' => ['type' => 'vitamin_b6', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'ng/mL'],
-
-            // Liver Function Tests
-            'alt' => ['type' => 'alt', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'U/L'],
-            'alanine aminotransferase' => ['type' => 'alt', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'U/L'],
-            'sgpt' => ['type' => 'alt', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'U/L'],
-            'ast' => ['type' => 'ast', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'U/L'],
-            'aspartate aminotransferase' => ['type' => 'ast', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'U/L'],
-            'sgot' => ['type' => 'ast', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'U/L'],
-            'alp' => ['type' => 'alp', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'U/L'],
-            'alkaline phosphatase' => ['type' => 'alp', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'U/L'],
-            'bilirubin' => ['type' => 'bilirubin', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'mg/dL'],
-            'total bilirubin' => ['type' => 'bilirubin', 'category' => 'organs', 'subcategory' => 'liver', 'default_unit' => 'mg/dL'],
-
-            // Kidney Function Tests
-            'creatinine' => ['type' => 'creatinine', 'category' => 'organs', 'subcategory' => 'kidney', 'default_unit' => 'mg/dL'],
-            'serum creatinine' => ['type' => 'creatinine', 'category' => 'organs', 'subcategory' => 'kidney', 'default_unit' => 'mg/dL'],
-            'bun' => ['type' => 'blood_urea_nitrogen', 'category' => 'organs', 'subcategory' => 'kidney', 'default_unit' => 'mg/dL'],
-            'blood urea nitrogen' => ['type' => 'blood_urea_nitrogen', 'category' => 'organs', 'subcategory' => 'kidney', 'default_unit' => 'mg/dL'],
-            'uric acid' => ['type' => 'uric_acid', 'category' => 'organs', 'subcategory' => 'kidney', 'default_unit' => 'mg/dL'],
-            'egfr' => ['type' => 'egfr', 'category' => 'organs', 'subcategory' => 'kidney', 'default_unit' => 'mL/min/1.73m²'],
-
-            // Blood Count (Complete Blood Count)
-            'hemoglobin' => ['type' => 'hemoglobin', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'g/dL'],
-            'hb' => ['type' => 'hemoglobin', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'g/dL'],
-            'hematocrit' => ['type' => 'hematocrit', 'category' => 'blood', 'subcategory' => null, 'default_unit' => '%'],
-            'hct' => ['type' => 'hematocrit', 'category' => 'blood', 'subcategory' => null, 'default_unit' => '%'],
-            'rbc count' => ['type' => 'rbc_count', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'million/µL'],
-            'red blood cell count' => ['type' => 'rbc_count', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'million/µL'],
-            'wbc count' => ['type' => 'wbc_count', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'thousand/µL'],
-            'white blood cell count' => ['type' => 'wbc_count', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'thousand/µL'],
-            'platelet count' => ['type' => 'platelet_count', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'thousand/µL'],
-            'platelets' => ['type' => 'platelet_count', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'thousand/µL'],
-
-            // Diabetes/Glucose
-            'glucose' => ['type' => 'glucose_fasting', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'mg/dL'],
-            'fasting glucose' => ['type' => 'glucose_fasting', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'mg/dL'],
-            'blood sugar' => ['type' => 'glucose_fasting', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'mg/dL'],
-            'hba1c' => ['type' => 'hba1c', 'category' => 'blood', 'subcategory' => null, 'default_unit' => '%'],
-            'glycated hemoglobin' => ['type' => 'hba1c', 'category' => 'blood', 'subcategory' => null, 'default_unit' => '%'],
-
-            // Iron Studies
-            'iron' => ['type' => 'iron', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'μg/dL'],
-            'serum iron' => ['type' => 'iron', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'μg/dL'],
-            'ferritin' => ['type' => 'ferritin', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'ng/mL'],
-            'tibc' => ['type' => 'tibc', 'category' => 'vitamins', 'subcategory' => null, 'default_unit' => 'μg/dL'],
-
-            // Cardiac Markers
-            'troponin' => ['type' => 'troponin', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'ng/mL'],
-            'ck-mb' => ['type' => 'ck_mb', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'ng/mL'],
-            'bnp' => ['type' => 'bnp', 'category' => 'organs', 'subcategory' => 'heart', 'default_unit' => 'pg/mL'],
-
-            // Electrolytes
-            'sodium' => ['type' => 'sodium', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'mEq/L'],
-            'potassium' => ['type' => 'potassium', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'mEq/L'],
-            'chloride' => ['type' => 'chloride', 'category' => 'blood', 'subcategory' => null, 'default_unit' => 'mEq/L'],
-
-            // Hormones
-            'testosterone' => ['type' => 'testosterone', 'category' => 'organs', 'subcategory' => 'endocrine', 'default_unit' => 'ng/dL'],
-            'estrogen' => ['type' => 'estrogen', 'category' => 'organs', 'subcategory' => 'endocrine', 'default_unit' => 'pg/mL'],
-            'cortisol' => ['type' => 'cortisol', 'category' => 'organs', 'subcategory' => 'endocrine', 'default_unit' => 'μg/dL'],
-            'insulin' => ['type' => 'insulin', 'category' => 'organs', 'subcategory' => 'endocrine', 'default_unit' => 'μIU/mL'],
-        ];
-
-        // Direct match
-        if (isset($mappings[$rawName])) {
-            return $mappings[$rawName];
-        }
-
-        // Fuzzy matching for variations
-        foreach ($mappings as $key => $mapping) {
-            if (strpos($rawName, $key) !== false || strpos($key, $rawName) !== false) {
-                return $mapping;
-            }
-        }
-
-        // Check for common variations
-        $variations = [
-            'cholesterol' => 'total_cholesterol',
-            'sugar' => 'glucose_fasting',
-            'haemoglobin' => 'hemoglobin',
-            'vit d' => 'vitamin_d',
-            'vit b12' => 'vitamin_b12',
-        ];
-
-        foreach ($variations as $variation => $standard) {
-            if (strpos($rawName, $variation) !== false && isset($mappings[$standard])) {
-                return $mappings[$standard];
-            }
-        }
-
-        return null; // No mapping found
-    }
-
-    /**
-     * Map AI status to health metric status
-     */
-    private function mapAIStatusToHealthStatus($aiStatus)
-    {
-        $statusMap = [
-            'normal' => 'normal',
-            'elevated' => 'high',
-            'high' => 'high',
-            'low' => 'high', // Both high and low are concerning
-            'decreased' => 'high',
-            'increased' => 'high',
-            'borderline' => 'borderline',
-            'slightly' => 'borderline',
-            'mild' => 'borderline',
-            'unknown' => 'normal'
-        ];
-
-        $aiStatus = strtolower($aiStatus);
-        return $statusMap[$aiStatus] ?? 'normal';
-    }
-
-    /**
-     * Format extracted metrics summary for response
-     */
-    private function formatExtractedMetricsSummary($metrics)
-    {
-        if (empty($metrics)) {
-            return 'No health metrics extracted from this report.';
-        }
-
-        $count = count($metrics);
-        $categories = collect($metrics)->groupBy('category')->keys()->filter()->values();
-        
-        if ($categories->count() > 1) {
-            return "Extracted {$count} health metrics across " . $categories->count() . " categories: " . $categories->join(', ');
-        } else if ($categories->count() === 1) {
-            return "Extracted {$count} health metrics from {$categories->first()} tests";
-        } else {
-            return "Extracted {$count} health metrics from your report";
-        }
-    }
+    // ✨ REMOVED: All legacy fallback methods no longer needed (300+ lines removed)
+    // - fallbackToLegacyExtraction()
+    // - parseStringFinding()
+    // - parseArrayFinding()  
+    // - mapToStandardMetricType() 
+    // - mapAIStatusToHealthStatus()
 
     /**
      * Get unique categories from extracted metrics
@@ -831,11 +540,62 @@ class ReportController extends Controller
     private function extractTextFromPDF($file)
     {
         try {
+            // First, try text extraction for digital PDFs
             $text = PdfToText::getText($file->getPathname());
-            return $this->normalizePdfText($text);
+            
+            // If we got meaningful text (more than just whitespace/minimal content)
+            if (strlen(trim($text)) > 50) {
+                Log::info('PDF text extraction successful (digital PDF)', [
+                    'text_length' => strlen($text),
+                    'method' => 'PdfToText'
+                ]);
+                return $this->normalizePdfText($text);
+            }
+            
+            // If text extraction failed or returned minimal content, use OCR
+            Log::info('PDF text extraction returned minimal content, trying OCR', [
+                'text_length' => strlen($text),
+                'method' => 'fallback_to_ocr'
+            ]);
+            
         } catch (\Exception $e) {
-            Log::error('PDF text extraction failed', ['error' => $e->getMessage()]);
-            throw new \Exception('Unable to extract text from PDF. Please ensure it is not password protected.');
+            Log::warning('PDF text extraction failed, falling back to OCR', [
+                'error' => $e->getMessage(),
+                'method' => 'fallback_to_ocr'
+            ]);
+        }
+        
+        // Fallback: Use OCR for scanned PDFs
+        try {
+            Log::info('Processing PDF with OCR', [
+                'file_path' => $file->getPathname(),
+                'method' => 'OCR'
+            ]);
+            
+            // Use the same OCR service as images
+            $ocrResult = $this->ocrService->extractTextFromImage($file->getPathname());
+            
+            if ($ocrResult['success'] && !empty($ocrResult['text'])) {
+                Log::info('PDF OCR processing successful', [
+                    'text_length' => strlen($ocrResult['text']),
+                    'confidence' => $ocrResult['confidence'],
+                    'method' => 'OCR'
+                ]);
+                return $ocrResult['text'];
+            } else {
+                Log::error('PDF OCR processing failed', [
+                    'success' => $ocrResult['success'],
+                    'error' => $ocrResult['error'] ?? 'Unknown OCR error'
+                ]);
+                throw new \Exception('OCR processing failed: ' . ($ocrResult['error'] ?? 'Unknown error'));
+            }
+            
+        } catch (\Exception $e) {
+            Log::error('PDF processing completely failed', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+            throw new \Exception('Unable to extract text from PDF. Please try converting to image format.');
         }
     }
 

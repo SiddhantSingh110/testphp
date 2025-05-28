@@ -2,10 +2,11 @@
 
 namespace App\Services\HealthMetricsExtraction\MetricMapping;
 
+use App\Services\HealthMetricsExtraction\Contracts\MetricMapperInterface;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Str;
+use App\Models\HealthMetric;
 
-class StandardMetricMapper
+class StandardMetricMapper implements MetricMapperInterface
 {
     protected array $standardMappings;
     protected array $fuzzyMappings;
@@ -123,6 +124,49 @@ class StandardMetricMapper
     }
 
     /**
+     * ✨ NEW: Check if this mapper can handle a specific parameter name
+     */
+    public function canHandle(string $rawName, array $context = []): bool
+    {
+        $cleanName = $this->cleanParameterName($rawName);
+        
+        // Check exact match
+        if (isset($this->standardMappings[$cleanName])) {
+            return true;
+        }
+        
+        // Check alias match
+        if (isset($this->aliasMap[$cleanName])) {
+            return true;
+        }
+        
+        // Check fuzzy match
+        foreach ($this->fuzzyMappings as $pattern => $standardType) {
+            if (strpos($cleanName, $pattern) !== false || strpos($pattern, $cleanName) !== false) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+    /**
+     * ✨ NEW: Get the mapper's priority level
+     */
+    public function getPriority(): int
+    {
+        return 1; // Highest priority for standard mappings
+    }
+
+    /**
+     * ✨ NEW: Get the mapper's name/identifier
+     */
+    public function getName(): string
+    {
+        return 'standard_metric_mapper';
+    }
+
+    /**
      * Clean and normalize parameter name for matching
      */
     protected function cleanParameterName(string $rawName): string
@@ -193,7 +237,8 @@ class StandardMetricMapper
 
         // Unit-based contextual matching
         $unitMappings = [
-            'mg/dl' => ['cholesterol', 'glucose', 'creatinine', 'bilirubin'],
+            'mg/dl' => ['cholesterol', 'glucose', 'creatinine', 'bilirubin', 'uric'],
+            'mg/dl' => ['hdl', 'ldl', 'triglycerides'],
             'miu/l' => ['tsh'],
             'ng/ml' => ['vitamin_d', 'ferritin'],
             'pg/ml' => ['vitamin_b12'],
@@ -231,6 +276,9 @@ class StandardMetricMapper
         // Add validation hints
         $enhanced['validation_hints'] = $this->getValidationHints($baseMapping, $context);
         
+        // Get reference ranges from HealthMetric model
+        $enhanced['reference_ranges'] = HealthMetric::getReferenceRanges($baseMapping['type']);
+        
         return $enhanced;
     }
 
@@ -264,8 +312,9 @@ class StandardMetricMapper
         $hints = [];
         
         // Add reference range hint
-        if (!empty($mapping['reference_range'])) {
-            $hints['reference_range'] = $mapping['reference_range'];
+        $referenceRanges = HealthMetric::getReferenceRanges($mapping['type']);
+        if ($referenceRanges) {
+            $hints['reference_ranges'] = $referenceRanges;
         }
         
         // Add unit validation hint
@@ -290,12 +339,13 @@ class StandardMetricMapper
     }
 
     /**
-     * Initialize comprehensive standard mappings (moved from ReportController)
+     * Initialize comprehensive standard mappings 
+     * MERGED from ReportController + HealthMetricsExtractionService + existing StandardMetricMapper
      */
     protected function initializeStandardMappings(): void
     {
         $this->standardMappings = [
-            // ===== CHOLESTEROL PANEL =====
+            // ===== CHOLESTEROL PANEL (Priority 1) =====
             'hdl' => [
                 'type' => 'hdl',
                 'category' => 'organs',
@@ -303,8 +353,7 @@ class StandardMetricMapper
                 'display_name' => 'HDL Cholesterol',
                 'default_unit' => 'mg/dL',
                 'priority' => 1,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 40, 'max' => 60, 'unit' => 'mg/dL']
+                'value_type' => 'numeric'
             ],
             'ldl' => [
                 'type' => 'ldl',
@@ -313,8 +362,7 @@ class StandardMetricMapper
                 'display_name' => 'LDL Cholesterol',
                 'default_unit' => 'mg/dL',
                 'priority' => 1,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 0, 'max' => 100, 'unit' => 'mg/dL']
+                'value_type' => 'numeric'
             ],
             'total_cholesterol' => [
                 'type' => 'total_cholesterol',
@@ -323,8 +371,7 @@ class StandardMetricMapper
                 'display_name' => 'Total Cholesterol',
                 'default_unit' => 'mg/dL',
                 'priority' => 1,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 125, 'max' => 200, 'unit' => 'mg/dL']
+                'value_type' => 'numeric'
             ],
             'triglycerides' => [
                 'type' => 'triglycerides',
@@ -333,8 +380,7 @@ class StandardMetricMapper
                 'display_name' => 'Triglycerides',
                 'default_unit' => 'mg/dL',
                 'priority' => 1,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 0, 'max' => 150, 'unit' => 'mg/dL']
+                'value_type' => 'numeric'
             ],
             'vldl' => [
                 'type' => 'vldl',
@@ -343,8 +389,16 @@ class StandardMetricMapper
                 'display_name' => 'VLDL Cholesterol',
                 'default_unit' => 'mg/dL',
                 'priority' => 2,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 5, 'max' => 40, 'unit' => 'mg/dL']
+                'value_type' => 'numeric'
+            ],
+            'non_hdl_cholesterol' => [
+                'type' => 'non_hdl_cholesterol',
+                'category' => 'organs',
+                'subcategory' => 'heart',
+                'display_name' => 'Non-HDL Cholesterol',
+                'default_unit' => 'mg/dL',
+                'priority' => 2,
+                'value_type' => 'numeric'
             ],
 
             // ===== THYROID PANEL =====
@@ -355,8 +409,7 @@ class StandardMetricMapper
                 'display_name' => 'TSH',
                 'default_unit' => 'mIU/L',
                 'priority' => 1,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 0.4, 'max' => 4.0, 'unit' => 'mIU/L']
+                'value_type' => 'numeric'
             ],
             't3' => [
                 'type' => 't3',
@@ -365,8 +418,7 @@ class StandardMetricMapper
                 'display_name' => 'T3',
                 'default_unit' => 'ng/dL',
                 'priority' => 2,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 80, 'max' => 200, 'unit' => 'ng/dL']
+                'value_type' => 'numeric'
             ],
             't4' => [
                 'type' => 't4',
@@ -375,8 +427,7 @@ class StandardMetricMapper
                 'display_name' => 'T4',
                 'default_unit' => 'μg/dL',
                 'priority' => 2,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 5.1, 'max' => 14.1, 'unit' => 'μg/dL']
+                'value_type' => 'numeric'
             ],
             'free_t3' => [
                 'type' => 'free_t3',
@@ -385,8 +436,7 @@ class StandardMetricMapper
                 'display_name' => 'Free T3',
                 'default_unit' => 'pg/mL',
                 'priority' => 2,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 2.0, 'max' => 4.4, 'unit' => 'pg/mL']
+                'value_type' => 'numeric'
             ],
             'free_t4' => [
                 'type' => 'free_t4',
@@ -395,8 +445,7 @@ class StandardMetricMapper
                 'display_name' => 'Free T4',
                 'default_unit' => 'ng/dL',
                 'priority' => 2,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 0.82, 'max' => 1.77, 'unit' => 'ng/dL']
+                'value_type' => 'numeric'
             ],
 
             // ===== VITAMINS & MINERALS =====
@@ -407,8 +456,7 @@ class StandardMetricMapper
                 'display_name' => 'Vitamin D',
                 'default_unit' => 'ng/mL',
                 'priority' => 1,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 30, 'max' => 100, 'unit' => 'ng/mL']
+                'value_type' => 'numeric'
             ],
             'vitamin_b12' => [
                 'type' => 'vitamin_b12',
@@ -417,8 +465,16 @@ class StandardMetricMapper
                 'display_name' => 'Vitamin B12',
                 'default_unit' => 'pg/mL',
                 'priority' => 1,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 200, 'max' => 900, 'unit' => 'pg/mL']
+                'value_type' => 'numeric'
+            ],
+            'vitamin_b6' => [
+                'type' => 'vitamin_b6',
+                'category' => 'vitamins',
+                'subcategory' => null,
+                'display_name' => 'Vitamin B6',
+                'default_unit' => 'ng/mL',
+                'priority' => 3,
+                'value_type' => 'numeric'
             ],
             'folate' => [
                 'type' => 'folate',
@@ -427,8 +483,7 @@ class StandardMetricMapper
                 'display_name' => 'Folate',
                 'default_unit' => 'ng/mL',
                 'priority' => 2,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 2.7, 'max' => 17.0, 'unit' => 'ng/mL']
+                'value_type' => 'numeric'
             ],
             'iron' => [
                 'type' => 'iron',
@@ -437,8 +492,7 @@ class StandardMetricMapper
                 'display_name' => 'Iron',
                 'default_unit' => 'μg/dL',
                 'priority' => 2,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 60, 'max' => 170, 'unit' => 'μg/dL']
+                'value_type' => 'numeric'
             ],
             'ferritin' => [
                 'type' => 'ferritin',
@@ -447,8 +501,16 @@ class StandardMetricMapper
                 'display_name' => 'Ferritin',
                 'default_unit' => 'ng/mL',
                 'priority' => 2,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 12, 'max' => 300, 'unit' => 'ng/mL']
+                'value_type' => 'numeric'
+            ],
+            'tibc' => [
+                'type' => 'tibc',
+                'category' => 'vitamins',
+                'subcategory' => null,
+                'display_name' => 'TIBC',
+                'default_unit' => 'μg/dL',
+                'priority' => 3,
+                'value_type' => 'numeric'
             ],
 
             // ===== LIVER FUNCTION =====
@@ -459,8 +521,7 @@ class StandardMetricMapper
                 'display_name' => 'ALT',
                 'default_unit' => 'U/L',
                 'priority' => 1,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 7, 'max' => 40, 'unit' => 'U/L']
+                'value_type' => 'numeric'
             ],
             'ast' => [
                 'type' => 'ast',
@@ -469,8 +530,7 @@ class StandardMetricMapper
                 'display_name' => 'AST',
                 'default_unit' => 'U/L',
                 'priority' => 1,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 8, 'max' => 40, 'unit' => 'U/L']
+                'value_type' => 'numeric'
             ],
             'alp' => [
                 'type' => 'alp',
@@ -479,8 +539,7 @@ class StandardMetricMapper
                 'display_name' => 'ALP',
                 'default_unit' => 'U/L',
                 'priority' => 2,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 44, 'max' => 147, 'unit' => 'U/L']
+                'value_type' => 'numeric'
             ],
             'bilirubin' => [
                 'type' => 'bilirubin',
@@ -489,8 +548,7 @@ class StandardMetricMapper
                 'display_name' => 'Bilirubin',
                 'default_unit' => 'mg/dL',
                 'priority' => 1,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 0.1, 'max' => 1.2, 'unit' => 'mg/dL']
+                'value_type' => 'numeric'
             ],
 
             // ===== KIDNEY FUNCTION =====
@@ -501,8 +559,7 @@ class StandardMetricMapper
                 'display_name' => 'Creatinine',
                 'default_unit' => 'mg/dL',
                 'priority' => 1,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 0.7, 'max' => 1.3, 'unit' => 'mg/dL']
+                'value_type' => 'numeric'
             ],
             'blood_urea_nitrogen' => [
                 'type' => 'blood_urea_nitrogen',
@@ -511,8 +568,7 @@ class StandardMetricMapper
                 'display_name' => 'Blood Urea Nitrogen',
                 'default_unit' => 'mg/dL',
                 'priority' => 1,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 7, 'max' => 20, 'unit' => 'mg/dL']
+                'value_type' => 'numeric'
             ],
             'uric_acid' => [
                 'type' => 'uric_acid',
@@ -521,8 +577,7 @@ class StandardMetricMapper
                 'display_name' => 'Uric Acid',
                 'default_unit' => 'mg/dL',
                 'priority' => 2,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 3.4, 'max' => 7.0, 'unit' => 'mg/dL']
+                'value_type' => 'numeric'
             ],
             'egfr' => [
                 'type' => 'egfr',
@@ -531,8 +586,7 @@ class StandardMetricMapper
                 'display_name' => 'eGFR',
                 'default_unit' => 'mL/min/1.73m²',
                 'priority' => 2,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 90, 'max' => 120, 'unit' => 'mL/min/1.73m²']
+                'value_type' => 'numeric'
             ],
 
             // ===== BLOOD COUNT =====
@@ -543,8 +597,7 @@ class StandardMetricMapper
                 'display_name' => 'Hemoglobin',
                 'default_unit' => 'g/dL',
                 'priority' => 1,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 12.0, 'max' => 17.5, 'unit' => 'g/dL']
+                'value_type' => 'numeric'
             ],
             'hematocrit' => [
                 'type' => 'hematocrit',
@@ -553,8 +606,7 @@ class StandardMetricMapper
                 'display_name' => 'Hematocrit',
                 'default_unit' => '%',
                 'priority' => 2,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 36, 'max' => 52, 'unit' => '%']
+                'value_type' => 'numeric'
             ],
             'rbc_count' => [
                 'type' => 'rbc_count',
@@ -563,8 +615,7 @@ class StandardMetricMapper
                 'display_name' => 'RBC Count',
                 'default_unit' => 'million/µL',
                 'priority' => 2,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 4.5, 'max' => 5.5, 'unit' => 'million/µL']
+                'value_type' => 'numeric'
             ],
             'wbc_count' => [
                 'type' => 'wbc_count',
@@ -573,8 +624,7 @@ class StandardMetricMapper
                 'display_name' => 'WBC Count',
                 'default_unit' => 'thousand/µL',
                 'priority' => 2,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 4.5, 'max' => 11.0, 'unit' => 'thousand/µL']
+                'value_type' => 'numeric'
             ],
             'platelet_count' => [
                 'type' => 'platelet_count',
@@ -583,8 +633,7 @@ class StandardMetricMapper
                 'display_name' => 'Platelet Count',
                 'default_unit' => 'thousand/µL',
                 'priority' => 2,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 150, 'max' => 450, 'unit' => 'thousand/µL']
+                'value_type' => 'numeric'
             ],
 
             // ===== DIABETES/GLUCOSE =====
@@ -595,8 +644,7 @@ class StandardMetricMapper
                 'display_name' => 'Fasting Glucose',
                 'default_unit' => 'mg/dL',
                 'priority' => 1,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 70, 'max' => 99, 'unit' => 'mg/dL']
+                'value_type' => 'numeric'
             ],
             'hba1c' => [
                 'type' => 'hba1c',
@@ -605,8 +653,103 @@ class StandardMetricMapper
                 'display_name' => 'HbA1c',
                 'default_unit' => '%',
                 'priority' => 1,
-                'value_type' => 'numeric',
-                'reference_range' => ['min' => 4.0, 'max' => 5.6, 'unit' => '%']
+                'value_type' => 'numeric'
+            ],
+
+            // ===== ELECTROLYTES =====
+            'sodium' => [
+                'type' => 'sodium',
+                'category' => 'blood',
+                'subcategory' => null,
+                'display_name' => 'Sodium',
+                'default_unit' => 'mEq/L',
+                'priority' => 2,
+                'value_type' => 'numeric'
+            ],
+            'potassium' => [
+                'type' => 'potassium',
+                'category' => 'blood',
+                'subcategory' => null,
+                'display_name' => 'Potassium',
+                'default_unit' => 'mEq/L',
+                'priority' => 2,
+                'value_type' => 'numeric'
+            ],
+            'chloride' => [
+                'type' => 'chloride',
+                'category' => 'blood',
+                'subcategory' => null,
+                'display_name' => 'Chloride',
+                'default_unit' => 'mEq/L',
+                'priority' => 3,
+                'value_type' => 'numeric'
+            ],
+
+            // ===== CARDIAC MARKERS =====
+            'troponin' => [
+                'type' => 'troponin',
+                'category' => 'organs',
+                'subcategory' => 'heart',
+                'display_name' => 'Troponin',
+                'default_unit' => 'ng/mL',
+                'priority' => 2,
+                'value_type' => 'numeric'
+            ],
+            'ck_mb' => [
+                'type' => 'ck_mb',
+                'category' => 'organs',
+                'subcategory' => 'heart',
+                'display_name' => 'CK-MB',
+                'default_unit' => 'ng/mL',
+                'priority' => 3,
+                'value_type' => 'numeric'
+            ],
+            'bnp' => [
+                'type' => 'bnp',
+                'category' => 'organs',
+                'subcategory' => 'heart',
+                'display_name' => 'BNP',
+                'default_unit' => 'pg/mL',
+                'priority' => 3,
+                'value_type' => 'numeric'
+            ],
+
+            // ===== HORMONES =====
+            'testosterone' => [
+                'type' => 'testosterone',
+                'category' => 'organs',
+                'subcategory' => 'endocrine',
+                'display_name' => 'Testosterone',
+                'default_unit' => 'ng/dL',
+                'priority' => 3,
+                'value_type' => 'numeric'
+            ],
+            'estrogen' => [
+                'type' => 'estrogen',
+                'category' => 'organs',
+                'subcategory' => 'endocrine',
+                'display_name' => 'Estrogen',
+                'default_unit' => 'pg/mL',
+                'priority' => 3,
+                'value_type' => 'numeric'
+            ],
+            'cortisol' => [
+                'type' => 'cortisol',
+                'category' => 'organs',
+                'subcategory' => 'endocrine',
+                'display_name' => 'Cortisol',
+                'default_unit' => 'μg/dL',
+                'priority' => 3,
+                'value_type' => 'numeric'
+            ],
+            'insulin' => [
+                'type' => 'insulin',
+                'category' => 'organs',
+                'subcategory' => 'endocrine',
+                'display_name' => 'Insulin',
+                'default_unit' => 'μIU/mL',
+                'priority' => 3,
+                'value_type' => 'numeric'
             ],
 
             // ===== SPECIAL CASES =====
@@ -617,14 +760,42 @@ class StandardMetricMapper
                 'display_name' => 'Blood Pressure',
                 'default_unit' => 'mmHg',
                 'priority' => 1,
-                'value_type' => 'blood_pressure',
-                'reference_range' => ['systolic' => ['min' => 90, 'max' => 120], 'diastolic' => ['min' => 60, 'max' => 80], 'unit' => 'mmHg']
+                'value_type' => 'blood_pressure'
+            ],
+
+            // ===== PHYSICAL MEASUREMENTS =====
+            'weight' => [
+                'type' => 'weight',
+                'category' => 'custom',
+                'subcategory' => null,
+                'display_name' => 'Weight',
+                'default_unit' => 'kg',
+                'priority' => 4,
+                'value_type' => 'numeric'
+            ],
+            'height' => [
+                'type' => 'height',
+                'category' => 'custom',
+                'subcategory' => null,
+                'display_name' => 'Height',
+                'default_unit' => 'cm',
+                'priority' => 4,
+                'value_type' => 'numeric'
+            ],
+            'bmi' => [
+                'type' => 'bmi',
+                'category' => 'custom',
+                'subcategory' => null,
+                'display_name' => 'BMI',
+                'default_unit' => 'kg/m²',
+                'priority' => 4,
+                'value_type' => 'numeric'
             ]
         ];
     }
 
     /**
-     * Initialize alias mappings for common variations
+     * Initialize comprehensive alias mappings for common variations
      */
     protected function initializeAliasMap(): void
     {
@@ -633,19 +804,30 @@ class StandardMetricMapper
             'hdl cholesterol' => 'hdl',
             'hdl-c' => 'hdl',
             'high density lipoprotein' => 'hdl',
+            'high-density lipoprotein' => 'hdl',
             'ldl cholesterol' => 'ldl',
             'ldl-c' => 'ldl',
             'low density lipoprotein' => 'ldl',
+            'low-density lipoprotein' => 'ldl',
             'cholesterol' => 'total_cholesterol',
             'chol' => 'total_cholesterol',
             'triglyceride' => 'triglycerides',
             'tg' => 'triglycerides',
+            'vldl cholesterol' => 'vldl',
+            'non hdl cholesterol' => 'non_hdl_cholesterol',
             
             // Thyroid variations
             'thyroid stimulating hormone' => 'tsh',
             'thyrotropin' => 'tsh',
             'triiodothyronine' => 't3',
             'thyroxine' => 't4',
+            'total triiodothyronine (t3)' => 't3',
+            'total triiodothyronine' => 't3',
+            'total thyroxine (t4)' => 't4', 
+            'total thyroxine' => 't4',
+            'tsh - ultrasensitive' => 'tsh',
+            'tsh ultrasensitive' => 'tsh',
+            'tsh-ultrasensitive' => 'tsh',
             
             // Vitamin variations
             'vit d' => 'vitamin_d',
