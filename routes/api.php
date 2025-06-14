@@ -72,6 +72,13 @@ Route::middleware('auth:sanctum')->prefix('patient')->group(function () {
     Route::get('/reports', [ReportController::class, 'index']);
     Route::get('/reports/{id}', [ReportController::class, 'show']);
     Route::delete('/reports/{id}', [ReportController::class, 'destroy']);
+
+    // ✅ SECURE: File download endpoint (replaces file_url)
+    Route::get('/reports/{id}/download', [ReportController::class, 'downloadFile']);
+    
+    // ✅ DEBUG: File info endpoint for debugging
+    Route::get('/reports/{id}/file-info', [ReportController::class, 'getFileInfo']);
+   
     
     // AI and finding details
     Route::get('/reports/{id}/summary-pdf', [ReportController::class, 'downloadSummaryPdf']);

@@ -9,7 +9,7 @@ use App\Models\HealthMetric;
 use App\Services\AISummaryService;
 use App\Services\OCRService;
 use App\Services\ImageProcessingService;
-use App\Services\HealthMetricsExtraction\HealthMetricsExtractionService; // ✨ Already added
+use App\Services\HealthMetricsExtraction\HealthMetricsExtractionService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
@@ -21,21 +21,31 @@ class ReportController extends Controller
 {
     protected $ocrService;
     protected $imageProcessingService;
-    protected $healthMetricsService; // ✨ Already added
+    protected $healthMetricsService;
 
     public function __construct(
         OCRService $ocrService, 
         ImageProcessingService $imageProcessingService,
-        HealthMetricsExtractionService $healthMetricsService = null // ✨ Already added
+        HealthMetricsExtractionService $healthMetricsService = null
     ) {
         $this->ocrService = $ocrService;
         $this->imageProcessingService = $imageProcessingService;
-        $this->healthMetricsService = $healthMetricsService ?? app(HealthMetricsExtractionService::class); // ✨ Already added
+        
+        // ✨ SAFE INITIALIZATION - Handle if service is not available
+        try {
+            $this->healthMetricsService = $healthMetricsService ?? app(HealthMetricsExtractionService::class);
+        } catch (\Exception $e) {
+            Log::warning('HealthMetricsExtractionService not available, falling back to legacy extraction', [
+                'error' => $e->getMessage()
+            ]);
+            $this->healthMetricsService = null;
+        }
         
         // Ensure storage directories exist
         ImageProcessingService::ensureDirectoriesExist();
     }
 
+    // ✅ KEEP: Your existing upload method (it's correct)
     public function upload(Request $request)
     {
         $request->validate([
@@ -55,7 +65,8 @@ class ReportController extends Controller
             'patient_id' => $patientId,
             'file_type' => $ext,
             'file_size' => $file->getSize(),
-            'is_image' => $isImage
+            'is_image' => $isImage,
+            'health_metrics_service_available' => !is_null($this->healthMetricsService)
         ]);
 
         try {
@@ -112,7 +123,13 @@ class ReportController extends Controller
             
             if ($isPdf) {
                 // Extract text from PDF
+                Log::info('🚀 Starting PDF text extraction', ['report_id' => $report->id]);
                 $extractedText = $this->extractTextFromPDF($file);
+                Log::info('📄 PDF text extraction completed', [
+                    'report_id' => $report->id,
+                    'text_length' => strlen($extractedText),
+                    'preview' => substr($extractedText, 0, 200)
+                ]);
             } else if ($isImage) {
                 // Process image with OCR
                 $ocrResult = $this->processImageWithOCR($report);
@@ -135,15 +152,26 @@ class ReportController extends Controller
             $cleanedText = '';
             
             if (!empty($extractedText)) {
+                Log::info('🤖 Starting AI summary generation', [
+                    'report_id' => $report->id,
+                    'text_length' => strlen($extractedText)
+                ]);
+                
                 // Clean text for database storage - remove problematic characters
                 $cleanedText = $this->cleanTextForDatabase($extractedText);
                 $aiSummaryJson = AISummaryService::generateSummary($cleanedText);
+                
+                Log::info('✅ AI summary generation completed', [
+                    'report_id' => $report->id,
+                    'has_summary' => !empty($aiSummaryJson),
+                    'confidence_score' => $aiSummaryJson['confidence_score'] ?? 'N/A'
+                ]);
             }
 
             // Create AI summary record
             $aiSummary = AISummary::create([
                 'report_id' => $report->id,
-                'raw_text' => $cleanedText, // Use cleaned text
+                'raw_text' => $cleanedText,
                 'summary_json' => $aiSummaryJson ?? [],
                 'confidence_score' => isset($aiSummaryJson['confidence_score']) 
                     ? (int) filter_var($aiSummaryJson['confidence_score'], FILTER_SANITIZE_NUMBER_INT) 
@@ -151,16 +179,32 @@ class ReportController extends Controller
                 'ai_model_used' => 'gpt-4',
             ]);
 
-            // Step 5: ✨ UPDATED - Extract health metrics using multi-provider system
+            // Step 5: ✨ SAFE HEALTH METRICS EXTRACTION
             if (!empty($aiSummaryJson) && isset($aiSummaryJson['key_findings'])) {
-                $extractedMetrics = $this->extractMetricsFromAISummary($aiSummaryJson, $patientId, $report);
-                $createdMetrics = $extractedMetrics['metrics'];
-
-                Log::info('Health metrics extracted from AI summary', [
+                Log::info('🔬 Starting health metrics extraction', [
                     'report_id' => $report->id,
-                    'metrics_count' => count($createdMetrics),
-                    'categories_found' => $extractedMetrics['categories_found']
+                    'service_available' => !is_null($this->healthMetricsService),
+                    'findings_count' => count($aiSummaryJson['key_findings'])
                 ]);
+                
+                try {
+                    $extractedMetrics = $this->extractMetricsFromAISummary($aiSummaryJson, $patientId, $report);
+                    $createdMetrics = $extractedMetrics['metrics'];
+
+                    Log::info('✅ Health metrics extraction completed', [
+                        'report_id' => $report->id,
+                        'metrics_count' => count($createdMetrics),
+                        'categories_found' => $extractedMetrics['categories_found']
+                    ]);
+                } catch (\Exception $e) {
+                    Log::error('❌ Health metrics extraction failed, continuing without metrics', [
+                        'report_id' => $report->id,
+                        'error' => $e->getMessage(),
+                        'will_continue' => true
+                    ]);
+                    // Don't fail the entire upload - just continue without metrics
+                    $createdMetrics = [];
+                }
             }
 
             // Step 6: Clean up original file if OCR was successful
@@ -196,8 +240,8 @@ class ReportController extends Controller
                         'source' => $metric->source,
                         'context' => $metric->context,
                         'reference_range' => $this->getReferenceRangeForMetric($metric->type),
-                        'is_recent' => true, // Mark as recent for review badge
-                        'needs_review' => true, // Enable review badge
+                        'is_recent' => true,
+                        'needs_review' => true,
                     ];
                 })->toArray()
             ];
@@ -210,7 +254,7 @@ class ReportController extends Controller
                 }
             }
 
-            Log::info('Report upload completed', [
+            Log::info('🎉 Report upload completed successfully', [
                 'report_id' => $report->id,
                 'ocr_status' => $report->ocr_status,
                 'metrics_created' => count($createdMetrics),
@@ -220,10 +264,11 @@ class ReportController extends Controller
             return response()->json($response, 201);
 
         } catch (\Exception $e) {
-            Log::error('Report upload failed', [
+            Log::error('💥 Report upload failed', [
                 'error' => $e->getMessage(),
                 'trace' => $e->getTraceAsString(),
-                'patient_id' => $patientId
+                'patient_id' => $patientId,
+                'file_type' => $ext
             ]);
 
             return response()->json([
@@ -234,98 +279,277 @@ class ReportController extends Controller
     }
 
     /**
-     * ✨ SIMPLIFIED: Extract health metrics using HealthMetricsExtractionService
-     * This replaces the old extractMetricsFromAISummary method with cleaner orchestration
+     * ✨ SAFE: Extract health metrics with fallback to legacy method
      */
     private function extractMetricsFromAISummary($aiSummaryJson, $patientId, $report)
     {
-        try {
-            Log::info('🚀 Starting health metrics extraction via service', [
-                'report_id' => $report->id,
-                'patient_id' => $patientId,
-                'has_ai_summary' => !empty($aiSummaryJson),
-                'extraction_method' => 'HealthMetricsExtractionService'
-            ]);
-
-            // ✨ CLEAN: Single service call replaces 200+ lines of duplicate logic
-            $extractionResult = $this->healthMetricsService->extractMetrics(
-                $report->aiSummary->raw_text ?? '', 
-                $aiSummaryJson, 
-                $patientId, 
-                $report
-            );
-
-            if ($extractionResult['success']) {
-                Log::info('✅ Health metrics extraction successful', [
+        // Try new service first if available
+        if ($this->healthMetricsService) {
+            try {
+                Log::info('🚀 Using new HealthMetricsExtractionService', [
                     'report_id' => $report->id,
-                    'provider_used' => $extractionResult['provider_used'],
-                    'model_used' => $extractionResult['model_used'],
-                    'metrics_extracted' => count($extractionResult['metrics']),
-                    'categories_found' => $extractionResult['categories_found'],
-                    'duration_ms' => $extractionResult['duration_ms'],
-                    'attempts_made' => $extractionResult['attempts_made']
+                    'service_class' => get_class($this->healthMetricsService)
                 ]);
 
-                return [
-                    'metrics' => $extractionResult['metrics'],
-                    'categories_found' => $extractionResult['categories_found'],
-                    'extraction_metadata' => [
+                $extractionResult = $this->healthMetricsService->extractMetrics(
+                    $report->aiSummary->raw_text ?? '', 
+                    $aiSummaryJson, 
+                    $patientId, 
+                    $report
+                );
+
+                if ($extractionResult['success']) {
+                    Log::info('✅ New service extraction successful', [
+                        'report_id' => $report->id,
                         'provider_used' => $extractionResult['provider_used'],
-                        'model_used' => $extractionResult['model_used'],
-                        'duration_ms' => $extractionResult['duration_ms'],
-                        'confidence_score' => $extractionResult['ai_response']['confidence_score'] ?? 'N/A',
-                        'extraction_version' => 'multi-provider-service-v2.0'
-                    ]
-                ];
-            } else {
-                Log::warning('⚠️ All providers failed for health metrics extraction', [
+                        'metrics_count' => count($extractionResult['metrics'])
+                    ]);
+
+                    return [
+                        'metrics' => $extractionResult['metrics'],
+                        'categories_found' => $extractionResult['categories_found'],
+                        'extraction_metadata' => [
+                            'method' => 'new_service',
+                            'provider_used' => $extractionResult['provider_used'],
+                            'model_used' => $extractionResult['model_used'],
+                            'duration_ms' => $extractionResult['duration_ms']
+                        ]
+                    ];
+                } else {
+                    Log::warning('⚠️ New service failed, falling back to legacy', [
+                        'report_id' => $report->id,
+                        'error' => $extractionResult['error']
+                    ]);
+                    // Fall through to legacy method
+                }
+            } catch (\Exception $e) {
+                Log::warning('⚠️ New service threw exception, falling back to legacy', [
                     'report_id' => $report->id,
-                    'attempts_made' => $extractionResult['attempts_made'],
-                    'duration_ms' => $extractionResult['duration_ms'],
-                    'error' => $extractionResult['error']
+                    'error' => $e->getMessage()
                 ]);
-
-                // ✨ NO FALLBACK: The service handles all provider fallbacks internally
-                return [
-                    'metrics' => [],
-                    'categories_found' => [],
-                    'extraction_metadata' => [
-                        'provider_used' => 'none',
-                        'model_used' => 'none',
-                        'duration_ms' => $extractionResult['duration_ms'],
-                        'error' => $extractionResult['error'],
-                        'extraction_version' => 'multi-provider-service-v2.0-failed'
-                    ]
-                ];
+                // Fall through to legacy method
             }
-
-        } catch (\Exception $e) {
-            Log::error('❌ Health metrics extraction service failed completely', [
-                'report_id' => $report->id,
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString()
-            ]);
-
-            // Return empty result on complete failure
-            return [
-                'metrics' => [],
-                'categories_found' => [],
-                'extraction_metadata' => [
-                    'provider_used' => 'error',
-                    'model_used' => 'error',
-                    'error' => $e->getMessage(),
-                    'extraction_version' => 'multi-provider-service-v2.0-error'
-                ]
-            ];
         }
+
+        // Fallback to legacy extraction method
+        Log::info('🔄 Using legacy extraction method', ['report_id' => $report->id]);
+        return $this->legacyExtractMetricsFromAISummary($aiSummaryJson, $patientId, $report);
     }
 
-    // ✨ REMOVED: All legacy fallback methods no longer needed (300+ lines removed)
-    // - fallbackToLegacyExtraction()
-    // - parseStringFinding()
-    // - parseArrayFinding()  
-    // - mapToStandardMetricType() 
-    // - mapAIStatusToHealthStatus()
+    /**
+     * ✨ LEGACY: Original extraction method as fallback
+     */
+    private function legacyExtractMetricsFromAISummary($aiSummaryJson, $patientId, $report)
+    {
+        $extractedMetrics = [];
+        $categoriesFound = [];
+
+        if (!isset($aiSummaryJson['key_findings']) || !is_array($aiSummaryJson['key_findings'])) {
+            Log::warning('No key_findings in AI response for legacy extraction', ['report_id' => $report->id]);
+            return ['metrics' => [], 'categories_found' => []];
+        }
+
+        foreach ($aiSummaryJson['key_findings'] as $finding) {
+            try {
+                // Parse finding (string or array)
+                $parsedMetric = $this->parseFinding($finding);
+                if (!$parsedMetric) {
+                    continue;
+                }
+
+                // Map to standard metric type (legacy way)
+                $standardType = $this->legacyMapToStandardMetricType($parsedMetric['raw_name']);
+                if (!$standardType) {
+                    Log::info('Could not map metric to standard type (legacy)', [
+                        'raw_name' => $parsedMetric['raw_name'],
+                        'report_id' => $report->id
+                    ]);
+                    continue;
+                }
+
+                // Create health metric record
+                $metric = HealthMetric::create([
+                    'patient_id' => $patientId,
+                    'type' => $standardType,
+                    'value' => $parsedMetric['value'],
+                    'unit' => $parsedMetric['unit'],
+                    'measured_at' => $report->report_date ?? now(),
+                    'notes' => "Auto-extracted from medical report (ID: {$report->id}) via legacy method",
+                    'source' => 'report',
+                    'context' => 'medical_test',
+                    'status' => $this->mapAIStatusToHealthStatus($parsedMetric['status']),
+                ]);
+
+                // Set categories using model method
+                $metric->setMetricCategories();
+                $metric->save();
+
+                $extractedMetrics[] = $metric;
+                if ($metric->category) {
+                    $categoriesFound[] = $metric->category;
+                }
+
+                Log::debug('Health metric created via legacy method', [
+                    'report_id' => $report->id,
+                    'raw_name' => $parsedMetric['raw_name'],
+                    'standardized_type' => $standardType,
+                    'value' => $parsedMetric['value'],
+                    'category' => $metric->category
+                ]);
+
+            } catch (\Exception $e) {
+                Log::error('Failed to process AI finding (legacy)', [
+                    'finding' => $finding,
+                    'error' => $e->getMessage(),
+                    'report_id' => $report->id
+                ]);
+                continue;
+            }
+        }
+
+        Log::info('Legacy metrics extraction completed', [
+            'report_id' => $report->id,
+            'metrics_created' => count($extractedMetrics),
+            'categories_found' => array_unique($categoriesFound)
+        ]);
+
+        return [
+            'metrics' => $extractedMetrics,
+            'categories_found' => array_unique($categoriesFound),
+            'extraction_metadata' => [
+                'method' => 'legacy',
+                'provider_used' => 'legacy_parser',
+                'model_used' => 'built_in_rules'
+            ]
+        ];
+    }
+
+    /**
+     * Parse individual finding from AI response
+     */
+    protected function parseFinding($finding): ?array
+    {
+        if (is_string($finding)) {
+            return $this->parseStringFinding($finding);
+        } elseif (is_array($finding)) {
+            return $this->parseArrayFinding($finding);
+        }
+        
+        return null;
+    }
+
+    /**
+     * Parse string-based finding
+     */
+    protected function parseStringFinding(string $finding): ?array
+    {
+        // Pattern 1: "Status level of Parameter Value Unit"
+        if (preg_match('/^(normal|elevated|high|low|decreased|increased|borderline|slightly)\s+level\s+of\s+(.+?)\s+([\d\.]+)\s*([a-zA-Z\/\%µ°]+)?/i', $finding, $matches)) {
+            return [
+                'raw_name' => trim($matches[2]),
+                'value' => $matches[3],
+                'unit' => $matches[4] ?? '',
+                'status' => strtolower($matches[1])
+            ];
+        }
+
+        // Pattern 2: "Parameter: Value Unit"
+        if (preg_match('/^(.+?):\s*([\d\.]+)\s*([a-zA-Z\/\%µ°]+)?/i', $finding, $matches)) {
+            return [
+                'raw_name' => trim($matches[1]),
+                'value' => $matches[2],
+                'unit' => $matches[3] ?? '',
+                'status' => 'unknown'
+            ];
+        }
+
+        // Pattern 3: "Parameter Value Unit (status)"
+        if (preg_match('/^(.+?)\s+([\d\.]+)\s*([a-zA-Z\/\%µ°]+)?\s*\((normal|high|low|elevated|decreased)\)/i', $finding, $matches)) {
+            return [
+                'raw_name' => trim($matches[1]),
+                'value' => $matches[2],
+                'unit' => $matches[3] ?? '',
+                'status' => strtolower($matches[4])
+            ];
+        }
+
+        return null;
+    }
+
+    /**
+     * Parse array-based finding
+     */
+    protected function parseArrayFinding(array $finding): ?array
+    {
+        if (!isset($finding['finding']) || !isset($finding['value'])) {
+            return null;
+        }
+
+        return [
+            'raw_name' => $finding['finding'],
+            'value' => $finding['value'],
+            'unit' => $finding['unit'] ?? '',
+            'status' => $finding['status'] ?? 'unknown'
+        ];
+    }
+
+    /**
+     * ✨ LEGACY: Map raw parameter name to standard metric type
+     */
+    private function legacyMapToStandardMetricType($rawName)
+    {
+        $cleanName = strtolower(trim($rawName));
+        
+        // Remove common prefixes/suffixes
+        $cleanName = preg_replace('/^(serum|plasma|blood|total|free)\s+/', '', $cleanName);
+        $cleanName = preg_replace('/\s+(level|concentration|count)$/', '', $cleanName);
+        
+        // Direct mappings
+        $mappings = [
+            'hdl cholesterol' => 'hdl',
+            'hdl' => 'hdl',
+            'ldl cholesterol' => 'ldl', 
+            'ldl' => 'ldl',
+            'total cholesterol' => 'total_cholesterol',
+            'cholesterol' => 'total_cholesterol',
+            'triglycerides' => 'triglycerides',
+            'vldl cholesterol' => 'vldl',
+            'vldl' => 'vldl',
+            'non hdl cholesterol' => 'non_hdl_cholesterol',
+            'vitamin d' => 'vitamin_d',
+            'vitamin b12' => 'vitamin_b12',
+            'tsh' => 'tsh',
+            'alt' => 'alt',
+            'ast' => 'ast',
+            'creatinine' => 'creatinine',
+            'hemoglobin' => 'hemoglobin',
+            'glucose' => 'glucose_fasting',
+            'hba1c' => 'hba1c'
+        ];
+        
+        return $mappings[$cleanName] ?? null;
+    }
+
+    /**
+     * Map AI status to health metric status
+     */
+    protected function mapAIStatusToHealthStatus(string $aiStatus): string
+    {
+        $statusMap = [
+            'normal' => 'normal',
+            'elevated' => 'high',
+            'high' => 'high',
+            'low' => 'high',
+            'decreased' => 'high',
+            'increased' => 'high',
+            'borderline' => 'borderline',
+            'slightly' => 'borderline',
+            'mild' => 'borderline',
+            'unknown' => 'normal'
+        ];
+
+        return $statusMap[strtolower($aiStatus)] ?? 'normal';
+    }
 
     /**
      * Get unique categories from extracted metrics
@@ -447,7 +671,7 @@ class ReportController extends Controller
             'metrics_summary' => $summary,
             'categories_found' => $categories->toArray(),
             'new_metrics_available' => true,
-            'needs_review_count' => $count, // All new metrics need review initially
+            'needs_review_count' => $count,
         ];
     }
 
@@ -715,10 +939,11 @@ class ReportController extends Controller
                     'report_date' => $report->report_date,
                     'file_type' => $report->type,
                     'summary_diagnosis' => $report->aiSummary->summary_json['diagnosis'] ?? null,
-                    'file_url' => $report->getFileUrl(),
                     'uploaded_by' => $report->uploaded_by,
                     'doctor_name' => $report->doctor ? $report->doctor->name : null,
                     'ocr_info' => $report->type === 'image' ? $report->getOCRStatusInfo() : null,
+                    'file_available' => $report->file_path && Storage::disk('public')->exists($report->file_path),
+                    'file_size' => $report->file_path ? $this->getFileSizeInfo($report->file_path) : null,
                 ];
             });
 
@@ -744,7 +969,6 @@ class ReportController extends Controller
             'report_date' => $report->report_date,
             'notes' => $report->notes,
             'uploaded_at' => $report->created_at->toDateTimeString(),
-            'file_url' => $report->getFileUrl(),
             'file_type' => $report->type,
             'uploaded_by' => $report->uploaded_by,
             'doctor_name' => $report->doctor ? $report->doctor->name : null,
@@ -753,7 +977,268 @@ class ReportController extends Controller
             'ai_model_used' => $report->aiSummary->ai_model_used ?? null,
             'raw_text' => Str::limit($report->aiSummary->raw_text ?? '', 1500),
             'ocr_info' => $report->type === 'image' ? $report->getOCRStatusInfo() : null,
+            'file_available' => $report->file_path && Storage::disk('public')->exists($report->file_path),
+            'file_size' => $report->file_path ? $this->getFileSizeInfo($report->file_path) : null,
+            'download_endpoint' => "/api/patient/reports/{$report->id}/download",
         ]);
+    }
+
+    /**
+     * ✅ CORRECTED: Download file with proper file structure handling
+     */
+    public function downloadFile($id)
+    {
+        try {
+            $patientId = auth()->id();
+            
+            \Log::info('🔍 Download request received', [
+                'report_id' => $id,
+                'patient_id' => $patientId,
+                'timestamp' => now()
+            ]);
+            
+            // Get the report
+            $report = PatientReport::where('patient_id', $patientId)
+                ->where('id', $id)
+                ->first();
+                
+            if (!$report) {
+                \Log::error('❌ Report not found', [
+                    'report_id' => $id,
+                    'patient_id' => $patientId
+                ]);
+                
+                return response()->json(['error' => 'Report not found'], 404);
+            }
+
+            \Log::info('✅ Report found', [
+                'report_id' => $report->id,
+                'file_path' => $report->file_path,
+                'file_type' => $report->type,
+                'original_file_path' => $report->original_file_path,
+                'compressed_file_path' => $report->compressed_file_path
+            ]);
+
+            // Determine which file to serve based on report type
+            $filePathToServe = null;
+            $fileDescription = '';
+
+            if ($report->type === 'pdf') {
+                // For PDF files, use the main file_path (should be in pdfs/ folder)
+                $filePathToServe = $report->file_path;
+                $fileDescription = 'PDF file';
+            } else if ($report->type === 'image') {
+                // For image files, prefer original over compressed
+                if ($report->original_file_path) {
+                    $filePathToServe = $report->original_file_path;
+                    $fileDescription = 'Original image file';
+                } else if ($report->compressed_file_path) {
+                    $filePathToServe = $report->compressed_file_path;
+                    $fileDescription = 'Compressed image file';
+                } else if ($report->file_path) {
+                    $filePathToServe = $report->file_path;
+                    $fileDescription = 'Image file';
+                }
+            } else {
+                // Fallback to main file_path
+                $filePathToServe = $report->file_path;
+                $fileDescription = 'Report file';
+            }
+
+            if (!$filePathToServe) {
+                \Log::error('❌ No file path available', [
+                    'report_id' => $report->id,
+                    'type' => $report->type
+                ]);
+                
+                return response()->json(['error' => 'No file associated with this report'], 404);
+            }
+
+            \Log::info('🔍 File path determined', [
+                'file_path_to_serve' => $filePathToServe,
+                'description' => $fileDescription
+            ]);
+
+            // Check if file exists in storage
+            if (!Storage::disk('public')->exists($filePathToServe)) {
+                \Log::error('❌ File not found in storage', [
+                    'file_path' => $filePathToServe,
+                    'storage_root' => Storage::disk('public')->path(''),
+                    'full_path' => Storage::disk('public')->path($filePathToServe)
+                ]);
+                
+                return response()->json([
+                    'error' => 'File not found in storage',
+                    'file_path' => $filePathToServe
+                ], 404);
+            }
+
+            // Get the actual file system path
+            $fullFilePath = Storage::disk('public')->path($filePathToServe);
+            
+            \Log::info('✅ File exists, preparing download', [
+                'full_file_path' => $fullFilePath,
+                'file_size' => filesize($fullFilePath)
+            ]);
+
+            // Generate download filename
+            $extension = pathinfo($filePathToServe, PATHINFO_EXTENSION);
+            $downloadName = ($report->report_title ?? 'Medical_Report') . '.' . $extension;
+            $downloadName = preg_replace('/[^a-zA-Z0-9._-]/', '_', $downloadName);
+
+            // Log the download for analytics
+            \Log::info('📁 File download started', [
+                'patient_id' => $patientId,
+                'report_id' => $report->id,
+                'file_path' => $filePathToServe,
+                'download_name' => $downloadName,
+                'file_size' => filesize($fullFilePath),
+                'ip_address' => request()->ip(),
+                'user_agent' => request()->userAgent()
+            ]);
+
+            // Return the file download
+            return response()->download($fullFilePath, $downloadName, [
+                'Content-Type' => $this->getContentType($extension),
+                'Content-Disposition' => 'attachment; filename="' . $downloadName . '"',
+                'Cache-Control' => 'no-cache, no-store, must-revalidate',
+                'Pragma' => 'no-cache',
+                'Expires' => '0'
+            ]);
+
+        } catch (\Exception $e) {
+            \Log::error('❌ Download exception', [
+                'patient_id' => auth()->id() ?? 'unknown',
+                'report_id' => $id,
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+                'trace' => $e->getTraceAsString()
+            ]);
+
+            return response()->json([
+                'error' => 'Download failed',
+                'message' => config('app.debug') ? $e->getMessage() : 'Please try again'
+            ], 500);
+        }
+    }
+
+    /**
+     * Helper method to get proper content type
+     */
+    private function getContentType($extension)
+    {
+        $contentTypes = [
+            'pdf' => 'application/pdf',
+            'jpg' => 'image/jpeg',
+            'jpeg' => 'image/jpeg',
+            'png' => 'image/png',
+            'gif' => 'image/gif'
+        ];
+
+        return $contentTypes[strtolower($extension)] ?? 'application/octet-stream';
+    }
+
+    /**
+     * ✅ DEBUGGING: Add file info endpoint to check what's available
+     */
+    public function getFileInfo($id)
+    {
+        try {
+            $patientId = auth()->id();
+            $report = PatientReport::where('patient_id', $patientId)->where('id', $id)->first();
+            
+            if (!$report) {
+                return response()->json(['error' => 'Report not found'], 404);
+            }
+            
+            $fileInfo = [];
+            
+            // Check main file_path
+            if ($report->file_path) {
+                $exists = Storage::disk('public')->exists($report->file_path);
+                $fileInfo['main_file'] = [
+                    'path' => $report->file_path,
+                    'exists' => $exists,
+                    'full_path' => Storage::disk('public')->path($report->file_path),
+                    'size' => $exists ? Storage::disk('public')->size($report->file_path) : null,
+                    'url' => $exists ? Storage::disk('public')->url($report->file_path) : null
+                ];
+            }
+            
+            // Check original file (for images)
+            if ($report->original_file_path) {
+                $exists = Storage::disk('public')->exists($report->original_file_path);
+                $fileInfo['original_file'] = [
+                    'path' => $report->original_file_path,
+                    'exists' => $exists,
+                    'full_path' => Storage::disk('public')->path($report->original_file_path),
+                    'size' => $exists ? Storage::disk('public')->size($report->original_file_path) : null,
+                    'url' => $exists ? Storage::disk('public')->url($report->original_file_path) : null
+                ];
+            }
+            
+            // Check compressed file (for images)
+            if ($report->compressed_file_path) {
+                $exists = Storage::disk('public')->exists($report->compressed_file_path);
+                $fileInfo['compressed_file'] = [
+                    'path' => $report->compressed_file_path,
+                    'exists' => $exists,
+                    'full_path' => Storage::disk('public')->path($report->compressed_file_path),
+                    'size' => $exists ? Storage::disk('public')->size($report->compressed_file_path) : null,
+                    'url' => $exists ? Storage::disk('public')->url($report->compressed_file_path) : null
+                ];
+            }
+            
+            return response()->json([
+                'report_id' => $report->id,
+                'report_type' => $report->type,
+                'report_title' => $report->report_title,
+                'files' => $fileInfo,
+                'storage_root' => Storage::disk('public')->path(''),
+                'base_url' => config('app.url')
+            ]);
+            
+        } catch (\Exception $e) {
+            return response()->json([
+                'error' => 'Failed to get file info',
+                'message' => $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * ✅ FIXED: Add missing getFileSizeInfo method
+     */
+    private function getFileSizeInfo($filePath)
+    {
+        try {
+            if (!Storage::disk('public')->exists($filePath)) {
+                return null;
+            }
+
+            $sizeInBytes = Storage::disk('public')->size($filePath);
+            
+            // Convert to human readable format
+            if ($sizeInBytes >= 1048576) {
+                $size = round($sizeInBytes / 1048576, 2) . ' MB';
+            } elseif ($sizeInBytes >= 1024) {
+                $size = round($sizeInBytes / 1024, 2) . ' KB';
+            } else {
+                $size = $sizeInBytes . ' bytes';
+            }
+
+            return [
+                'bytes' => $sizeInBytes,
+                'formatted' => $size
+            ];
+        } catch (\Exception $e) {
+            \Log::warning('Failed to get file size', [
+                'file_path' => $filePath,
+                'error' => $e->getMessage()
+            ]);
+            return null;
+        }
     }
 
     /**
