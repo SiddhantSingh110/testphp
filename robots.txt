@@ -1,0 +1,135 @@
+# =============================================================================
+# STRICT ROBOTS.TXT - NO INDEXING ALLOWED
+# =============================================================================
+# This API server is private and not intended for public access
+# All web crawlers, bots, and automated systems are strictly prohibited
+# =============================================================================
+
+# Block ALL user agents (web crawlers, bots, etc.)
+User-agent: *
+Disallow: /
+
+# Explicitly block major search engines
+User-agent: Googlebot
+Disallow: /
+
+User-agent: Bingbot
+Disallow: /
+
+User-agent: Slurp
+Disallow: /
+
+User-agent: DuckDuckBot
+Disallow: /
+
+User-agent: Baiduspider
+Disallow: /
+
+User-agent: YandexBot
+Disallow: /
+
+User-agent: facebookexternalhit
+Disallow: /
+
+User-agent: Twitterbot
+Disallow: /
+
+User-agent: LinkedInBot
+Disallow: /
+
+User-agent: WhatsApp
+Disallow: /
+
+User-agent: Applebot
+Disallow: /
+
+# Block AI/ML crawlers
+User-agent: GPTBot
+Disallow: /
+
+User-agent: ChatGPT-User
+Disallow: /
+
+User-agent: CCBot
+Disallow: /
+
+User-agent: anthropic-ai
+Disallow: /
+
+User-agent: Claude-Web
+Disallow: /
+
+# Block SEO and analysis tools
+User-agent: AhrefsBot
+Disallow: /
+
+User-agent: SemrushBot
+Disallow: /
+
+User-agent: MJ12bot
+Disallow: /
+
+User-agent: DotBot
+Disallow: /
+
+# Block archive services
+User-agent: ia_archiver
+Disallow: /
+
+User-agent: Wayback
+Disallow: /
+
+# Block vulnerability scanners and security tools
+User-agent: Nmap
+Disallow: /
+
+User-agent: Nikto
+Disallow: /
+
+User-agent: sqlmap
+Disallow: /
+
+User-agent: w3af
+Disallow: /
+
+User-agent: Burp
+Disallow: /
+
+User-agent: OWASP
+Disallow: /
+
+# Block generic crawlers and scrapers
+User-agent: *Bot*
+Disallow: /
+
+User-agent: *Spider*
+Disallow: /
+
+User-agent: *Crawler*
+Disallow: /
+
+User-agent: *Scraper*
+Disallow: /
+
+# =============================================================================
+# ADDITIONAL SECURITY MEASURES
+# =============================================================================
+
+# No sitemap provided (we don't want to help crawlers)
+# Sitemap: (intentionally left blank)
+
+# Crawl delay set to maximum for any bot that ignores disallow
+Crawl-delay: 86400
+
+# =============================================================================
+# NOTES
+# =============================================================================
+# - This file blocks ALL automated access via robots.txt protocol
+# - However, robots.txt is just a suggestion - malicious bots may ignore it
+# - Consider additional security measures:
+#   * IP whitelisting
+#   * API authentication/authorization
+#   * Rate limiting
+#   * WAF (Web Application Firewall)
+#   * Server-level access controls
+# =============================================================================
