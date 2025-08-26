@@ -24,3 +24,5 @@ yarn-error.log
 __MACOSX/
 .DS_Store
 *.zip
+/storage/app/public/*
+/public/storage/*
