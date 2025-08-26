@@ -17,3 +17,10 @@ yarn-error.log
 *.log
 /public/uploads
 /public/files
+.env
+.env.*
+*.env
+.env copy
+__MACOSX/
+.DS_Store
+*.zip
